@@ -55,7 +55,7 @@ async function stop(): Promise<boolean> {
     unlinkSync(paths.pid());
     return false;
   }
-  for (let i = 0; i < 30 && (await daemonHealth(loadConfig())); i++) await new Promise((r) => setTimeout(r, 100));
+  for (let i = 0; i < 100 && (await daemonHealth(loadConfig())); i++) await new Promise((r) => setTimeout(r, 100));
   return true;
 }
 

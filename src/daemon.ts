@@ -52,6 +52,9 @@ export interface DaemonOptions {
 }
 
 export async function runDaemon(opts: DaemonOptions = {}) {
+  // One bad request or a bug in a handler must never take down every session and the browser link.
+  process.on("unhandledRejection", (e: any) => log(`unhandled rejection: ${e?.stack ?? e}`));
+  process.on("uncaughtException", (e: any) => log(`uncaught exception: ${e?.stack ?? e}`));
   const cfg: Config = loadConfig();
   if (opts.port) cfg.port = opts.port;
   if (opts.lanHost !== undefined) cfg.lanHost = opts.lanHost;
@@ -85,7 +88,10 @@ export async function runDaemon(opts: DaemonOptions = {}) {
 
     // One McpServer per client session. It has to be connected before the initialize request is handled,
     // so the session gets its id a moment later, when the transport mints it.
-    const session = new Session();
+    // The shim sends a stable per-process key so the session can find its tab again after reconnects.
+    const keyHeader = req.headers["x-tabpilot-client"];
+    const key = typeof keyHeader === "string" && /^[A-Za-z0-9-]{8,64}$/.test(keyHeader) ? keyHeader : randomUUID();
+    const session = new Session(key);
     const server = createMcpServer(pilot, session);
     const transport: StreamableHTTPServerTransport = new StreamableHTTPServerTransport({
       sessionIdGenerator: () => randomUUID(),

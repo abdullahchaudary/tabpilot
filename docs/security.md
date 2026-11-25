@@ -13,7 +13,7 @@ tabpilot gives an AI the controls of a browser that might be logged into your em
 | a different extension pretends to be tabpilot | origin check against the fixed extension ID, and it'd still need the pairing code |
 | other users on a shared machine | `~/.tabpilot` is `0700` and `config.json` is `0600`. the MCP endpoint needs the code |
 | the agent going somewhere it shouldn't | optional `allow` list (see below) |
-| you want it to stop, now | Cancel on Chrome's debugging bar (per tab), or **MAYDAY** in the popup (everything) |
+| you want it to stop, now | **Pause** (`Alt+Shift+P`), **release** a tab, Cancel on Chrome's debugging bar, or **MAYDAY** (`Alt+Shift+X`). all enforced inside the extension, so the daemon can't override them |
 
 ## what's not
 
@@ -43,7 +43,8 @@ you always know when tabpilot is in control:
 - the **extension badge** says `ON` (green) when paired
 - **Chrome's yellow "tabpilot started debugging this browser" bar** shows up the whole time any tab is attached. Chrome forces it and extensions can't hide it, which is a good thing
 - agent-opened tabs sit in a **color-coded tab group** called `tabpilot xxxx`
-- the popup shows how many tabs are being flown
+- the popup lists every tab being flown and what the AI did last
+- the badge turns orange `II` while paused
 
 ## the pairing code
 

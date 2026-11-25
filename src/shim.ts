@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { openSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -31,7 +32,8 @@ export async function ensureDaemon(cfg: Config): Promise<void> {
   const out = openSync(paths.log(), "a");
   const child = spawn(process.execPath, [cli, "daemon"], { detached: true, stdio: ["ignore", out, out], env: process.env });
   child.unref();
-  for (let i = 0; i < 50; i++) {
+  // Generous on purpose: on a loaded box Node can take several seconds just to boot.
+  for (let i = 0; i < 150; i++) {
     await new Promise((r) => setTimeout(r, 100));
     if (await daemonHealth(cfg)) return;
   }
@@ -48,28 +50,48 @@ export async function runShim() {
 
   let client: Client | null = null;
   let transport: StreamableHTTPClientTransport | null = null;
+  let connecting: Promise<Client> | null = null;
+  // Stable for this process. The daemon uses it to name our tab group, which is how we find our tab
+  // again after the daemon restarts or the browser reconnects.
+  const clientKey = randomUUID();
 
-  const connect = async () => {
-    cfg = loadConfig(); // re-read so `tabpilot rotate` doesn't strand running sessions
-    transport = new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${cfg.port}/mcp`), {
-      requestInit: { headers: { Authorization: `Bearer ${cfg.pairingCode}` } },
-    });
-    const c = new Client({ name: "tabpilot-shim", version: VERSION });
-    await c.connect(transport);
-    client = c;
-    return c;
+  const connect = (): Promise<Client> => {
+    connecting ??= (async () => {
+      cfg = loadConfig(); // re-read so `tabpilot rotate` doesn't strand running sessions
+      await ensureDaemon(cfg);
+      const t = new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${cfg.port}/mcp`), {
+        requestInit: { headers: { Authorization: `Bearer ${cfg.pairingCode}`, "x-tabpilot-client": clientKey } },
+      });
+      const c = new Client({ name: "tabpilot-shim", version: VERSION });
+      await c.connect(t).catch((e) => {
+        if (/401/.test(String(e?.message))) {
+          throw new Error(`The daemon on port ${cfg.port} has a different pairing code than ${paths.config()}. Another TABPILOT_HOME's daemon? Run \`tabpilot restart\`.`);
+        }
+        throw e;
+      });
+      transport = t;
+      client = c;
+      return c;
+    })().finally(() => (connecting = null));
+    return connecting;
   };
 
-  // If the daemon restarted under us, our HTTP session is gone. Reconnect once and retry.
+  // Retry only when we know the request never ran: the daemon forgot our session (it restarted),
+  // the code rotated, or nothing was listening. Never blindly re-run a tool that may have executed.
+  const retriable = (e: any) => {
+    const msg = String(e?.message ?? e);
+    const code = e?.cause?.code ?? e?.code;
+    return code === "ECONNREFUSED" || /session not found|HTTP 404|HTTP 401|\b40[14]\b|ECONNREFUSED/i.test(msg);
+  };
+
   const withClient = async <T>(fn: (c: Client) => Promise<T>): Promise<T> => {
+    const c = client ?? (await connect());
     try {
-      return await fn(client ?? (await connect()));
-    } catch (e: any) {
-      const msg = String(e?.message ?? e);
-      if (!/session not found|fetch failed|ECONNREFUSED|404|401|pairing code/i.test(msg)) throw e;
-      client = null;
-      await ensureDaemon(cfg);
-      return fn(await connect());
+      return await fn(c);
+    } catch (e) {
+      if (!retriable(e)) throw e;
+      if (client === c) client = null; // only the first failing call resets; the rest share the reconnect
+      return fn(client ?? (await connect()));
     }
   };
 

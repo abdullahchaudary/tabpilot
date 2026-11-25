@@ -1,6 +1,9 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import { mkdir, writeFile } from "node:fs/promises";
+import { dirname, isAbsolute, join } from "node:path";
 import { z } from "zod";
+import { homeDir } from "./config.js";
 import type { NetworkEntry } from "./bridge.js";
 import type { Pilot, Session, Target } from "./pilot.js";
 import { VERSION } from "./version.js";
@@ -77,6 +80,7 @@ export function createMcpServer(pilot: Pilot, s: Session): McpServer {
         `  ${i.userAgent ?? ""}`,
         `  extension v${i.extensionVersion ?? "?"}, daemon v${VERSION}`,
         `  sessions flying: ${pilot.sessions.size}`,
+        bridge.paused ? "  ⏸ PAUSED by the user. Wait for them to resume." : "  controls: active",
         `  allow-list: ${pilot.cfg.allow.length ? pilot.cfg.allow.join(", ") : "off (any site)"}`,
       ];
       if (s.tabId !== null) {
@@ -115,22 +119,18 @@ export function createMcpServer(pilot: Pilot, s: Session): McpServer {
       const created = await bridge.call<{ tabId: number; groupId: number | null }>("tabs.create", {
         active: !background,
         groupId: s.groupId,
-        groupTitle: `tabpilot ${s.label}`,
+        groupTitle: s.groupTitle,
         groupColor: s.color,
       });
       s.groupId = created.groupId;
       s.tabId = created.tabId;
       await pilot.attach(s, created.tabId);
-      let errorText: string | undefined;
-      const result = await pilot.waitForLoad(
-        s,
-        async () => {
-          const r = await pilot.cdp(s, "Page.navigate", { url: target });
-          errorText = r.errorText;
-        },
-        20_000,
-      );
-      if (errorText) return text(`Opened tab ${created.tabId}, but loading ${target} failed: ${errorText}`);
+      let result: string;
+      try {
+        result = await pilot.navigate(s, () => pilot.cdp(s, "Page.navigate", { url: target }), 20_000);
+      } catch (e: any) {
+        return text(`Opened tab ${created.tabId}, but ${e.message}`);
+      }
       const title = await pilot.evaluate<string>(s, "document.title").catch(() => "");
       return text(`Opened tab ${created.tabId}: ${title || target}${result === "timeout" ? " (still loading after 20s)" : ""}\nNext: snapshot to see what's on the page.`);
     },
@@ -147,9 +147,8 @@ export function createMcpServer(pilot: Pilot, s: Session): McpServer {
     async ({ tabId, focus, force }) => {
       const t = await bridge.call<any>("tabs.get", { tabId });
       pilot.checkAllowed(t.url);
-      if (force) pilot.unrelease(tabId);
-      await pilot.attach(s, tabId);
-      s.tabId = tabId;
+      await pilot.attach(s, tabId, force);
+      s.tabId = tabId; // note: we don't adopt the user's tab group; our own tabs stay in ours
       if (focus) await bridge.call("tabs.activate", { tabId });
       return text(`Now driving tab ${tabId}: ${t.title} (${t.url}).\nHeads up: console/network history starts now. Use navigate with action "reload" to capture startup logs.`);
     },
@@ -160,7 +159,7 @@ export function createMcpServer(pilot: Pilot, s: Session): McpServer {
     "Close a tab. Defaults to the current tab.",
     { tabId: z.number().int().optional() },
     async ({ tabId }) => {
-      const id = tabId ?? pilot.tab(s);
+      const id = tabId ?? (await pilot.tab(s));
       await bridge.call("tabs.close", { tabId: id });
       if (s.tabId === id) s.tabId = null;
       return text(`Closed tab ${id}.`);
@@ -172,22 +171,18 @@ export function createMcpServer(pilot: Pilot, s: Session): McpServer {
 
   tool(
     "navigate",
-    "Go to a URL in the current tab, or go back / forward / reload. Waits for the load event.",
+    "Go to a URL in the current tab, or go back / forward / reload. Waits for the page to load (SPA route changes return right away).",
     {
       url: z.string().optional(),
       action: z.enum(["back", "forward", "reload", "hard-reload"]).optional(),
       timeoutMs: z.number().int().max(120_000).optional().describe("How long to wait for load. Default 20000."),
     },
     async ({ url, action, timeoutMs = 20_000 }) => {
-      let errorText: string | undefined;
       let trigger: () => Promise<unknown>;
       if (url) {
         const target = /^[a-z][a-z0-9+.-]*:/i.test(url) ? url : `http://${url}`;
         pilot.checkAllowed(target);
-        trigger = async () => {
-          const r = await pilot.cdp(s, "Page.navigate", { url: target });
-          errorText = r.errorText;
-        };
+        trigger = () => pilot.cdp(s, "Page.navigate", { url: target });
       } else if (action === "reload" || action === "hard-reload") {
         trigger = () => pilot.cdp(s, "Page.reload", { ignoreCache: action === "hard-reload" });
       } else if (action === "back" || action === "forward") {
@@ -198,10 +193,10 @@ export function createMcpServer(pilot: Pilot, s: Session): McpServer {
       } else {
         throw new Error("Give me a url or an action (back, forward, reload, hard-reload).");
       }
-      const result = await pilot.waitForLoad(s, trigger, timeoutMs);
-      if (errorText) throw new Error(`Navigation failed: ${errorText}`);
+      const result = await pilot.navigate(s, trigger, timeoutMs);
       const where = await pilot.evaluate<{ url: string; title: string }>(s, "({url: location.href, title: document.title})").catch(() => null);
-      return text(`${result === "timeout" ? `Still loading after ${timeoutMs}ms, but here's where we are` : "Loaded"}: ${where?.title ?? ""} (${where?.url ?? url})`);
+      const how = result === "timeout" ? `Still loading after ${timeoutMs}ms, but here's where we are` : result === "same-document" ? "Moved (same page, no reload)" : "Loaded";
+      return text(`${how}: ${where?.title ?? ""} (${where?.url ?? url})`);
     },
   );
 
@@ -233,28 +228,71 @@ export function createMcpServer(pilot: Pilot, s: Session): McpServer {
 
   tool(
     "screenshot",
-    "Take a picture of the current tab: the viewport, the full page, or a single element. Brings the tab to the front if it's hidden (background tabs can't paint).",
+    "Take a picture of the current tab (the viewport, the full page, or one element) and look at it. Sized for you to read (~1568px wide, retina gets scaled down). Optionally saves the file to disk too. Brings the tab to the front if it's hidden (background tabs can't paint).",
     {
-      fullPage: z.boolean().optional(),
+      fullPage: z.boolean().optional().describe("The whole scrollable page. Very tall pages get cropped; you'll be told where."),
       ...targetShape,
-      format: z.enum(["png", "jpeg"]).optional().describe("Default png (viewport/element), jpeg for full page."),
+      format: z.enum(["png", "jpeg"]).optional().describe("Default png for viewport/element, jpeg for full page. Big PNGs switch to jpeg automatically."),
+      maxWidth: z.number().int().min(200).max(4000).optional().describe("Max image width in pixels. Default 1568."),
+      save: z.union([z.boolean(), z.string()]).optional().describe("true = save to ~/.tabpilot/screenshots/, or an absolute file path. Handy for bug reports and before/after comparisons."),
     },
-    async ({ fullPage, ref, selector, text: byText, format }) => {
+    async ({ fullPage, ref, selector, text: byText, format, maxWidth = 1568, save }) => {
       await pilot.ensureVisible(s);
-      const fmt = format ?? (fullPage ? "jpeg" : "png");
-      const params: Record<string, unknown> = { format: fmt, ...(fmt === "jpeg" ? { quality: 75 } : {}) };
+      const view = await pilot.evaluate<{ x: number; y: number; w: number; h: number; dpr: number }>(
+        s,
+        "({x: scrollX, y: scrollY, w: innerWidth, h: innerHeight, dpr: devicePixelRatio})",
+      );
+      let clip: { x: number; y: number; width: number; height: number };
+      let what = "viewport";
       if (ref || selector || byText) {
         const box = await pilot.locate(s, { ref, selector, text: byText });
-        params.clip = { x: box.pageX, y: box.pageY, width: Math.max(1, box.width), height: Math.max(1, box.height), scale: 1 };
-        params.captureBeyondViewport = true;
+        clip = { x: box.pageX, y: box.pageY, width: Math.max(1, box.width), height: Math.max(1, box.height) };
+        what = `element ${ref ?? selector ?? JSON.stringify(byText)}`;
       } else if (fullPage) {
         const m = await pilot.cdp(s, "Page.getLayoutMetrics");
         const size = m.cssContentSize ?? m.contentSize;
-        params.clip = { x: 0, y: 0, width: Math.min(size.width, 8000), height: Math.min(size.height, 8000), scale: 1 };
-        params.captureBeyondViewport = true;
+        clip = { x: 0, y: 0, width: size.width, height: size.height };
+        what = "full page";
+      } else {
+        clip = { x: view.x, y: view.y, width: view.w, height: view.h };
       }
-      const shot = await pilot.cdp(s, "Page.captureScreenshot", params, 45_000);
-      return { content: [{ type: "image", data: shot.data, mimeType: `image/${fmt}` }] };
+      // Clip coords are CSS px; output px = css * scale * devicePixelRatio.
+      // Claude sees ~1568px best and rejects anything over 8000px on a side or 5MB.
+      const scale = Math.min(1, maxWidth / (clip.width * view.dpr));
+      const maxCssHeight = Math.floor(7900 / (scale * view.dpr));
+      let cropped = "";
+      if (clip.height > maxCssHeight) {
+        cropped = ` Cropped at ${maxCssHeight}px of ${Math.round(clip.height)}px; scroll and take another for the rest.`;
+        clip.height = maxCssHeight;
+      }
+      let fmt: "png" | "jpeg" = format ?? (fullPage ? "jpeg" : "png");
+      const capture = (f: "png" | "jpeg", quality?: number) =>
+        pilot.cdp(s, "Page.captureScreenshot", { format: f, ...(f === "jpeg" ? { quality } : {}), clip: { ...clip, scale }, captureBeyondViewport: what !== "viewport" }, 45_000);
+      let shot = await capture(fmt, 80);
+      for (const q of [60, 40]) {
+        if (shot.data.length <= 3_500_000) break;
+        fmt = "jpeg";
+        shot = await capture("jpeg", q);
+      }
+      const w = Math.round(clip.width * scale * view.dpr);
+      const h = Math.round(clip.height * scale * view.dpr);
+      let saved = "";
+      if (save) {
+        const file =
+          typeof save === "string"
+            ? save
+            : join(homeDir(), "screenshots", `${new Date().toISOString().replace(/[:.]/g, "-")}.${fmt === "jpeg" ? "jpg" : "png"}`);
+        if (!isAbsolute(file)) throw new Error("save needs an absolute path (or true for ~/.tabpilot/screenshots/).");
+        await mkdir(dirname(file), { recursive: true });
+        await writeFile(file, Buffer.from(shot.data, "base64"));
+        saved = ` Saved to ${file}`;
+      }
+      return {
+        content: [
+          { type: "image", data: shot.data, mimeType: `image/${fmt}` },
+          { type: "text", text: `${what}, ${w}×${h}px ${fmt}${scale < 1 ? ` (scaled ${Math.round(scale * 100)}% from ${Math.round(clip.width * view.dpr)}px wide)` : ""}.${cropped}${saved}` },
+        ],
+      };
     },
     { readOnlyHint: true },
   );
@@ -411,7 +449,11 @@ export function createMcpServer(pilot: Pilot, s: Session): McpServer {
       })()`;
       const start = Date.now();
       while (Date.now() - start < timeoutMs) {
-        const found = await pilot.evaluate<boolean>(s, check).catch(() => false);
+        const found = await pilot.evaluate<boolean>(s, check).catch((e) => {
+          // A page mid-navigation throws; that's just "not yet". Losing the browser or a pause is not.
+          if (!bridge.connected || bridge.paused) throw e;
+          return false;
+        });
         if (found !== !!gone) return text(`${gone ? "Gone" : "Found it"} after ${Date.now() - start}ms.`);
         await new Promise((r) => setTimeout(r, 200));
       }
@@ -456,7 +498,7 @@ export function createMcpServer(pilot: Pilot, s: Session): McpServer {
       clear: z.boolean().optional().describe("Empty the buffer after reading."),
     },
     async ({ level = "all", since, search, limit = 100, clear }) => {
-      const r = bridge.recorder(pilot.tab(s));
+      const r = bridge.recorder(await pilot.tab(s));
       const rank: Record<string, number> = { error: 4, warn: 3, info: 2, log: 2, debug: 1 };
       let rows = r.console.filter((e) => since === undefined || e.seq > since);
       if (level === "error") rows = rows.filter((e) => e.level === "error");
@@ -488,7 +530,7 @@ export function createMcpServer(pilot: Pilot, s: Session): McpServer {
       clear: z.boolean().optional(),
     },
     async ({ filter, type, failed, since, limit = 60, clear }) => {
-      const r = bridge.recorder(pilot.tab(s));
+      const r = bridge.recorder(await pilot.tab(s));
       let rows = [...r.network.values()].sort((a, b) => a.seq - b.seq);
       if (since !== undefined) rows = rows.filter((e) => e.seq > since);
       if (filter) rows = rows.filter((e) => e.url.includes(filter));
@@ -513,7 +555,7 @@ export function createMcpServer(pilot: Pilot, s: Session): McpServer {
       maxBody: z.number().int().optional().describe("Max chars of response body. Default 20000."),
     },
     async ({ seq, maxBody = 20_000 }) => {
-      const r = bridge.recorder(pilot.tab(s));
+      const r = bridge.recorder(await pilot.tab(s));
       const e = [...r.network.values()].find((x) => x.seq === seq);
       if (!e) throw new Error(`No request #${seq} in the buffer.`);
       const hdrs = (h?: Record<string, string>) => (h ? Object.entries(h).map(([k, v]) => `  ${k}: ${v}`).join("\n") : "  (none recorded)");

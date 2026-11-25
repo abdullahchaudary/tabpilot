@@ -87,7 +87,13 @@ export class Channel {
     this.recvChain = this.recvChain
       .then(async () => {
         const pt = await crypto.subtle.decrypt({ name: "AES-GCM", iv: ivFor(counter) }, this.recvKey, fromB64(frame));
-        this.onMessage(JSON.parse(dec.decode(pt)));
+        const msg = JSON.parse(dec.decode(pt));
+        // A bug in a handler is not a crypto failure. Report it, keep the channel up.
+        try {
+          this.onMessage(msg);
+        } catch (e) {
+          console.error("tabpilot: message handler failed", e);
+        }
       })
       .catch((e) => this.onError(e));
     return this.recvChain;

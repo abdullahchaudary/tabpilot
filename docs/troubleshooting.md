@@ -51,17 +51,25 @@ one daemon flies one browser at a time. a second browser (or a second profile) p
 
 the daemon's fine, but no extension is paired right now. open the popup and hit Connect. if it was connected before, Chrome might've put the service worker to sleep and the alarm will reconnect it within ~30s. or just click the icon, which wakes it up.
 
+## the AI says "The user paused tabpilot"
+
+that's you! someone hit **Pause** in the popup (or `Alt+Shift+P`). the badge shows `II` in orange. open the popup and hit **Resume AI**.
+
+## the debugging bar went away on its own / logs stopped
+
+tabpilot lets go of tabs nobody's touched in 15 minutes, so a forgotten session can't leave the yellow bar up forever. the next tool call grabs the tab again, but anything logged while it was let go isn't recorded. reload the page if you need those startup logs.
+
+## "Another extension is already debugging this tab"
+
+some other extension (screenshot tools, other automation stuff) is attached with `chrome.debugger`. turn it off for that tab or use a different tab.
+
 ## "Chrome doesn't let extensions debug this page"
 
 `chrome://` pages, the Chrome Web Store, and other extensions' pages are off-limits to every extension. that's Chrome's rule. use a regular web page.
 
-## "Another debugger is already attached"
-
-usually that's another extension that uses `chrome.debugger` (some screenshot or automation tools). disable it for that tab. DevTools being open is fine.
-
 ## "The user took back tab N"
 
-you hit Cancel on Chrome's debugging bar. that's the "hands off" signal, so tabpilot won't reattach on its own. tell Claude it's okay and it'll call `tab_select` with `force: true`.
+you hit Cancel on Chrome's debugging bar, or **release** in the popup. that's the "hands off" signal, so tabpilot won't reattach on its own. tell Claude it's okay and it'll call `tab_select` with `force: true`.
 
 ## screenshots hang or come back blank
 

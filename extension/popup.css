@@ -44,3 +44,33 @@ button { cursor: pointer; border-radius: 6px; padding: 7px 12px; font: inherit; 
 .mayday:hover { background: #2b1414; }
 footer { margin-top: 12px; color: var(--muted); font-size: 11px; text-align: center; }
 a { color: var(--accent); }
+.status[data-state="paused"] .light { background: #f08c00; box-shadow: 0 0 8px #f08c00; }
+#deck { margin-bottom: 12px; }
+.pause {
+  width: 100%; padding: 10px; font-weight: 700; font-size: 14px;
+  background: #3b2a06; color: #ffd8a8; border-color: #8a5a00;
+}
+.pause:hover { background: #4d3608; }
+.pause.resume { background: #0f3d1e; color: #b2f2bb; border-color: #2f9e44; }
+.pause.resume:hover { background: #145227; }
+.activity {
+  margin: 8px 0 10px; padding: 7px 9px; border-radius: 6px; background: var(--panel);
+  border: 1px solid var(--line); color: var(--muted); font-size: 12px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.activity b { color: var(--text); font-weight: 600; }
+.tabs-head { display: flex; justify-content: space-between; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .05em; margin-bottom: 4px; }
+#tabs { list-style: none; margin: 0; padding: 0; max-height: 150px; overflow-y: auto; }
+#tabs li {
+  display: flex; gap: 6px; align-items: center; padding: 5px 0; border-bottom: 1px solid var(--line);
+}
+#tabs li:last-child { border-bottom: 0; }
+#tabs .t { flex: 1; min-width: 0; cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#tabs .t:hover { color: var(--accent); }
+#tabs .empty { color: var(--muted); font-size: 12px; cursor: default; }
+#tabs button { padding: 2px 8px; font-size: 11px; background: transparent; color: var(--muted); }
+#tabs button:hover { color: var(--bad); border-color: var(--bad); }
+details { margin-bottom: 12px; }
+summary { cursor: pointer; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .05em; margin-bottom: 8px; }
+footer { display: flex; justify-content: space-between; }
+kbd { font: 10px ui-monospace, monospace; padding: 0 3px; border: 1px solid var(--line); border-radius: 3px; }

@@ -59,7 +59,7 @@ closes `tabId`, or the current tab.
 | `action` | `back`, `forward`, `reload`, `hard-reload` (skips cache) |
 | `timeoutMs` | how long to wait for load, default 20s |
 
-waits for the `load` event. if it times out, it tells you where the page got to instead of failing.
+waits for *that* navigation's `load` event, tracked by CDP's loader ID, so a slow earlier navigation can't fool it. same-page moves (hash links, SPA route changes, back/forward inside an SPA) come back right away as "Moved (same page, no reload)". if a load times out, it tells you where the page got to instead of failing.
 
 ## eyes
 
@@ -94,9 +94,17 @@ it's way cheaper than a screenshot, so Claude should use it for most things and 
 ### `screenshot`
 | param | |
 |---|---|
-| `fullPage` | the whole scrollable page (capped at 8000px), JPEG by default |
+| `fullPage` | the whole scrollable page, JPEG by default. super tall pages get cropped and Claude's told where |
 | `ref` / `selector` / `text` | just that element |
-| `format` | `png` or `jpeg` |
+| `format` | `png` or `jpeg`. big PNGs switch to JPEG on their own |
+| `maxWidth` | max image width in pixels, default 1568 |
+| `save` | `true` saves to `~/.tabpilot/screenshots/`, or give it an absolute path |
+
+the image goes straight back to Claude, and it *looks* at it, same as when you paste a screenshot into the chat. along with it comes a line like `viewport, 1568×980px png (scaled 61% from 2560px wide). Saved to ~/.tabpilot/screenshots/2026-...png`.
+
+sizing is handled for you. Claude reads images best around 1568px wide and rejects anything over 8000px or 5MB, so retina captures get scaled down, tall full-page shots get cropped, and oversized PNGs fall back to JPEG.
+
+`save` is handy for bug reports, PR descriptions, and before/after comparisons. the file lands on the machine running the daemon, the same one Claude's on.
 
 background tabs can't paint, so if the tab's hidden, tabpilot brings it to the front first.
 
@@ -233,4 +241,6 @@ the escape hatch. some fun ones:
 
 - **dialogs**: `alert`, `confirm`, `prompt` and `beforeunload` would freeze the page. tabpilot accepts them right away and logs them to the console
 - **startup logs**: `tab_open` attaches before navigating, so nothing gets missed
-- **cleanup**: when a session ends, its debugger attachments get released
+- **cleanup**: when a session ends, its debugger attachments get released. tabs untouched for 15 minutes get let go too, and the next tool call picks them back up (recording pauses in between)
+- **pause**: if you hit Pause in the popup, every tool fails fast with a message telling the AI to wait for you
+- **finding its way back**: each session's tabs live in a tab group named after it. if the daemon restarts or the browser reconnects, the session finds its tab again through that group

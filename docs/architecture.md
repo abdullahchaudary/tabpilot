@@ -35,7 +35,7 @@ this is what your MCP client actually launches. it's tiny on purpose:
 
 why bother? every Claude Code session spawns its own MCP process. if each one tried to own the browser connection, the second session would crash into the first over port 7337, and two sessions would fight over the same extension. so the shims are disposable and the daemon is the one that actually flies the plane.
 
-if the daemon restarts under a shim (say you ran `tabpilot restart`), the shim reconnects on the next call. no need to restart Claude.
+if the daemon restarts under a shim (say you ran `tabpilot restart`), the shim reconnects on the next call and the session finds its tab again (see sessions and tabs below). no need to restart Claude. it only retries when it knows the request never ran (session gone, connection refused, code rotated), so a tool never runs twice.
 
 ### 2. the daemon: `tabpilot daemon`
 
@@ -44,7 +44,7 @@ one per machine. it's got:
 - **`/mcp`**: streamable HTTP MCP endpoint. one MCP session per client, each with its own state (current tab, tab group). localhost only, needs `Authorization: Bearer <pairing code>`, and checks the `Host` header so a sketchy website can't DNS-rebind its way in.
 - **`/ext`**: the WebSocket the extension connects to. only accepts the tabpilot extension's origin (`chrome-extension://bhfdplcnlbphflpcffgabmdmnckndojf`), then runs the pairing handshake.
 - **`/health`**: name, version, whether a browser's connected. no secrets.
-- **the Pilot**: turns "click e12" into CDP calls: finding the element, scrolling it into view, real `Input.dispatchMouseEvent` presses. it also tracks which session has which tab attached.
+- **the Pilot**: turns "click e12" into CDP calls: finding the element, scrolling it into view, real `Input.dispatchMouseEvent` presses. it also tracks which session has which tab attached, shares one attach between sessions grabbing the same tab, and tracks navigations by loader ID.
 - **the black box**: a recorder per tab that keeps the last 1000 console entries and 1000 network requests from CDP events.
 
 all the smart stuff lives here, in TypeScript. that's on purpose: the extension stays dumb, so most updates are just `git pull && tabpilot restart` with no extension reload.
@@ -57,7 +57,7 @@ a Manifest V3 service worker that:
 - does the pairing handshake and encrypts everything
 - runs a short list of commands: `tabs.list/get/create/close/activate`, `debugger.attach/detach`, and `cdp`, which is a raw `chrome.debugger.sendCommand`
 - forwards the CDP events the daemon cares about: console, exceptions, log entries, network lifecycle, page loads, dialogs
-- shows status in the popup and badge, plus the MAYDAY kill switch
+- shows status, live activity and the tabs it holds in the popup, and gives you pause/resume, per-tab release, disconnect and MAYDAY (plus keyboard shortcuts)
 
 **keeping the service worker alive.** MV3 kills idle service workers. Chrome 116+ keeps one alive while its WebSocket is busy, so the extension pings every 20s. a 30-second `chrome.alarms` alarm wakes it back up to reconnect if Chrome killed it anyway. reconnects back off from 1s to 30s.
 
@@ -93,10 +93,16 @@ requests look like `{id, method, params}` → `{id, result}` or `{id, error}`. e
 
 ## sessions and tabs
 
+- the shim makes a random key when it starts and sends it with every request. the daemon names the session's tab group after it (`tabpilot a3f9`), and the color comes from it too
+- **the tab group is the session's memory.** if the daemon restarts or the browser reconnects, the session asks the extension for its group and picks up its tab again. no state file needed
+- if a *different* browser pairs (or the same one restarted), every tab id is suspect. the extension sends a per-run instance id, and when it changes, sessions forget their tabs and look them up fresh
 - each MCP session gets a short label and a color. `tab_open` puts its tabs in a Chrome tab group like `tabpilot a3f9`, so you can see who's driving what
 - sessions can grab *any* tab with `tab_select`, including another session's or one you opened yourself. it's your browser, after all
 - the debugger attachment is ref-counted. when the last session using a tab ends, tabpilot detaches and Chrome's debugging bar goes away
-- if you hit **Cancel** on Chrome's debugging bar, that tab's marked as released. tabpilot won't reattach unless the agent passes `force: true`, and the tool tells it to ask you first
+- if you hit **Cancel** on Chrome's debugging bar or **release** in the popup, that tab's marked as released, *in the extension* (session storage, so it survives the service worker sleeping). the extension refuses to reattach unless the agent passes `force: true`, and the tool tells it to ask you first
+- **pause** is enforced in the extension too: while paused, every command gets bounced with a "the user paused tabpilot" error. the daemon mirrors the state so tools fail fast with the same message
+- when the connection drops, the extension detaches from every tab, so Chrome's debugging bar never outlives the daemon
+- tabs untouched for 15 minutes get detached (sessions that vanish without saying bye, like a killed client, can't leave the bar up forever). the next tool call reattaches
 
 ## why an extension and not `--remote-debugging-port`?
 

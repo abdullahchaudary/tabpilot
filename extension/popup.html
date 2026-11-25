@@ -21,24 +21,39 @@
     </div>
   </section>
 
-  <label>Daemon address
-    <input id="server" spellcheck="false" placeholder="ws://127.0.0.1:7337/ext" />
-  </label>
-  <label>Pairing code <span class="hint">run <code>tabpilot pair</code></span>
-    <div class="row">
-      <input id="code" type="password" spellcheck="false" autocomplete="off" placeholder="tp-xxxxx-xxxxx-xxxxx-xxxxx" />
-      <button id="reveal" class="ghost" title="Show / hide">👁</button>
+  <!-- shown while connected -->
+  <section id="deck" hidden>
+    <button id="pause" class="pause">⏸ Pause AI</button>
+    <div class="activity" id="activity">standing by</div>
+    <div class="tabs-head">
+      <span>Tabs under control</span><span id="tabcount">0</span>
     </div>
-  </label>
+    <ul id="tabs"></ul>
+  </section>
 
-  <div class="actions">
-    <button id="connect" class="primary">Connect</button>
-    <button id="disconnect" class="ghost">Disconnect</button>
-  </div>
+  <details id="setup" open>
+    <summary>Connection</summary>
+    <label>Daemon address
+      <input id="server" spellcheck="false" placeholder="ws://127.0.0.1:7337/ext" />
+    </label>
+    <label>Pairing code <span class="hint">run <code>tabpilot pair</code></span>
+      <div class="row">
+        <input id="code" type="password" spellcheck="false" autocomplete="off" placeholder="tp-xxxxx-xxxxx-xxxxx-xxxxx" />
+        <button id="reveal" class="ghost" title="Show / hide">👁</button>
+      </div>
+    </label>
+    <div class="actions">
+      <button id="connect" class="primary">Connect</button>
+      <button id="disconnect" class="ghost">Disconnect</button>
+    </div>
+  </details>
 
-  <button id="mayday" class="mayday" title="Detach from every tab and disconnect">MAYDAY: release all tabs</button>
+  <button id="mayday" class="mayday" title="Release every tab and disconnect (Alt+Shift+X)">MAYDAY: release everything + hang up</button>
 
-  <footer>v<span id="version"></span> · <a href="https://github.com/abdullahchaudary/tabpilot" target="_blank">docs</a></footer>
+  <footer>
+    <span><kbd>Alt</kbd><kbd>Shift</kbd><kbd>P</kbd> pause · <kbd>Alt</kbd><kbd>Shift</kbd><kbd>X</kbd> mayday</span>
+    <span>v<span id="version"></span> · <a href="https://github.com/abdullahchaudary/tabpilot" target="_blank">docs</a></span>
+  </footer>
   <script src="popup.js" type="module"></script>
 </body>
 </html>

@@ -30,7 +30,15 @@ npm run e2e          # the full flight: real Chromium + extension + daemon + shi
 E2E_LAN=192.168.1.50 npm run e2e   # same thing, over a LAN address
 ```
 
-`e2e` needs a Chromium that still accepts `--load-extension`. Playwright's Chromium (`npx playwright install chromium`) or Chrome for Testing both work, and so does plain Chromium. branded Google Chrome dropped that flag in v137. point at a specific binary with `CHROME=/path/to/chrome`.
+and the big one:
+
+```bash
+node scripts/claude-smoke.mjs      # real Claude Code reads a code that only exists as pixels in a screenshot
+```
+
+it needs `claude` on your PATH and logged in, and it spends a few cents of tokens.
+
+`e2e` and `claude-smoke` need a Chromium that still accepts `--load-extension`. Playwright's Chromium (`npx playwright install chromium`) or Chrome for Testing both work, and so does plain Chromium. branded Google Chrome dropped that flag in v137. point at a specific binary with `CHROME=/path/to/chrome`.
 
 if you add a tool, add a check for it to `scripts/e2e.mjs`.
 

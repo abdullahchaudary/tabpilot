@@ -2,21 +2,39 @@ import type { Bridge } from "./bridge.js";
 import { hostAllowed, type Config } from "./config.js";
 import { log } from "./log.js";
 
-/** One connected MCP client (one Claude Code session, one Cursor window, ...). */
+/**
+ * One connected MCP client (one Claude Code session, one Cursor window, ...).
+ * `key` is stable for the life of the client process (the shim sends it), so after a daemon restart
+ * or a browser reconnect the session can find its tab again through its tab group, "tabpilot <label>".
+ */
 export class Session {
+  /** MCP session id. Changes if the shim has to reconnect. */
   id = "";
   tabId: number | null = null;
   groupId: number | null = null;
+  /** Did we already try to recover tabId from the browser's tab groups? */
+  recovered = false;
   readonly color: string;
-  private static count = 0;
   private static colors = ["blue", "purple", "cyan", "green", "orange", "pink", "yellow", "red"];
 
-  constructor() {
-    this.color = Session.colors[Session.count++ % Session.colors.length];
+  constructor(readonly key: string) {
+    let h = 0;
+    for (const c of key) h = (h * 31 + c.charCodeAt(0)) >>> 0;
+    this.color = Session.colors[h % Session.colors.length];
   }
 
   get label(): string {
-    return this.id.slice(0, 4);
+    return this.key.replace(/-/g, "").slice(0, 4);
+  }
+
+  get groupTitle(): string {
+    return `tabpilot ${this.label}`;
+  }
+
+  forgetTab() {
+    this.tabId = null;
+    this.groupId = null;
+    this.recovered = false;
   }
 }
 
@@ -42,6 +60,20 @@ const KEYS: Record<string, { code: string; keyCode: number; text?: string }> = {
   PageUp: { code: "PageUp", keyCode: 33 },
   PageDown: { code: "PageDown", keyCode: 34 },
   F5: { code: "F5", keyCode: 116 },
+};
+const PUNCTUATION: Record<string, [string, number]> = {
+  ".": ["Period", 190],
+  ",": ["Comma", 188],
+  "/": ["Slash", 191],
+  ";": ["Semicolon", 186],
+  "'": ["Quote", 222],
+  "[": ["BracketLeft", 219],
+  "]": ["BracketRight", 221],
+  "\\": ["Backslash", 220],
+  "-": ["Minus", 189],
+  "=": ["Equal", 187],
+  "`": ["Backquote", 192],
+  " ": ["Space", 32],
 };
 const MODIFIERS: Record<string, number> = { alt: 1, control: 2, ctrl: 2, meta: 4, cmd: 4, command: 4, shift: 8 };
 
@@ -153,14 +185,20 @@ const LOCATE_FN = function (t: { ref?: string; selector?: string; text?: string 
   return { x, y, width: r.width, height: r.height, pageX: r.left + scrollX, pageY: r.top + scrollY, tag: el.tagName.toLowerCase(), covered };
 };
 
+const IDLE_DETACH_MS = 15 * 60_000;
+
 /**
  * The shared brain behind every MCP session: owns debugger attachments, translates
  * high-level actions into CDP calls, and keeps sessions from tripping over each other.
  */
 export class Pilot {
-  /** tabId -> sessions currently using it. The debugger detaches when nobody is left. */
+  /** tabId -> MCP session ids currently using it. The debugger detaches when nobody is left. */
   private attachments = new Map<number, Set<string>>();
-  /** Tabs where the user hit "Cancel" on Chrome's debugging bar. We don't sneak back in. */
+  /** In-flight attaches, so two sessions grabbing the same tab at once share one attach. */
+  private attaching = new Map<number, Promise<void>>();
+  /** Last time any session touched each attached tab. Idle tabs get let go. */
+  private lastUsed = new Map<number, number>();
+  /** Tabs the user took back. The extension enforces this too; we keep a copy for clear error messages. */
   private released = new Set<number>();
   readonly sessions = new Map<string, Session>();
 
@@ -170,18 +208,29 @@ export class Pilot {
   ) {
     bridge.on("detached", (tabId: number, reason: string) => {
       this.attachments.delete(tabId);
-      if (reason === "canceled_by_user") {
+      if (reason === "canceled_by_user" || reason === "released_by_user") {
         this.released.add(tabId);
-        this.bridge.recorder(tabId).pushConsole({ ts: Date.now(), level: "tabpilot", text: "the user took the controls back (debugger canceled)" });
+        this.bridge.recorder(tabId).pushConsole({ ts: Date.now(), level: "tabpilot", text: "the user took the controls back for this tab" });
         log(`user released tab ${tabId}`);
       }
     });
     bridge.on("tabRemoved", (tabId: number) => {
       this.attachments.delete(tabId);
       this.released.delete(tabId);
+      this.lastUsed.delete(tabId);
       for (const s of this.sessions.values()) if (s.tabId === tabId) s.tabId = null;
     });
-    bridge.on("disconnected", () => this.attachments.clear());
+    // The extension detaches everything when the connection drops, so our view starts clean next time.
+    bridge.on("disconnected", () => {
+      this.attachments.clear();
+      this.attaching.clear();
+    });
+    // A different browser (or a restarted one) means every tab id we hold could point at the wrong tab.
+    bridge.on("newBrowser", () => {
+      this.released.clear();
+      this.lastUsed.clear();
+      for (const s of this.sessions.values()) s.forgetTab();
+    });
     // alert()/confirm()/prompt() freeze the page until someone answers. We answer, and write it down.
     bridge.on("cdp", (tabId: number, method: string, p: any) => {
       if (method !== "Page.javascriptDialogOpening") return;
@@ -190,6 +239,25 @@ export class Pilot {
         .catch(() => {});
       this.bridge.recorder(tabId).pushConsole({ ts: Date.now(), level: "dialog", text: `${p.type}(${JSON.stringify(p.message)}) → auto-accepted` });
     });
+    // Sessions that vanish without saying goodbye (killed client, crashed shim) would leave Chrome's
+    // "being debugged" bar up forever. Let go of tabs nobody has touched in a while.
+    setInterval(() => this.detachIdle(), 60_000).unref();
+  }
+
+  private async detachIdle() {
+    const now = Date.now();
+    for (const [tabId, at] of this.lastUsed) {
+      if (now - at < IDLE_DETACH_MS || !this.attachments.has(tabId)) continue;
+      this.attachments.delete(tabId);
+      this.lastUsed.delete(tabId);
+      await this.bridge.call("debugger.detach", { tabId }).catch(() => {});
+      this.bridge.recorder(tabId).pushConsole({
+        ts: now,
+        level: "tabpilot",
+        text: `let go of this tab after ${IDLE_DETACH_MS / 60_000} idle minutes; console/network recording paused until the next tool call`,
+      });
+      log(`released idle tab ${tabId}`);
+    }
   }
 
   async closeSession(s: Session) {
@@ -198,6 +266,7 @@ export class Pilot {
       users.delete(s.id);
       if (users.size === 0) {
         this.attachments.delete(tabId);
+        this.lastUsed.delete(tabId);
         await this.bridge.call("debugger.detach", { tabId }).catch(() => {});
       }
     }
@@ -209,34 +278,65 @@ export class Pilot {
     }
   }
 
-  async attach(s: Session, tabId: number) {
+  async attach(s: Session, tabId: number, force = false) {
+    if (force) this.released.delete(tabId);
     if (this.released.has(tabId)) {
-      throw new Error(`The user took back tab ${tabId} (they canceled the debugger bar). Ask them before grabbing it again, then call tab_select with force: true.`);
+      throw new Error(
+        `The user took back tab ${tabId} (released it in the extension or canceled Chrome's debugging bar). Ask them before grabbing it again, then call tab_select with force: true.`,
+      );
     }
-    let users = this.attachments.get(tabId);
-    if (!users) {
-      await this.bridge.call("debugger.attach", { tabId });
-      users = new Set();
-      this.attachments.set(tabId, users);
-      const send = (method: string, params = {}) => this.bridge.call("cdp", { tabId, method, params });
-      await Promise.all([send("Page.enable"), send("Runtime.enable"), send("Log.enable"), send("Network.enable")]);
+    if (!this.attachments.has(tabId)) {
+      let pending = this.attaching.get(tabId);
+      if (!pending) {
+        pending = (async () => {
+          await this.bridge.call("debugger.attach", { tabId, force });
+          const send = (method: string, params = {}) => this.bridge.call("cdp", { tabId, method, params });
+          await Promise.all([
+            send("Page.enable"),
+            send("Page.setLifecycleEventsEnabled", { enabled: true }),
+            send("Runtime.enable"),
+            send("Log.enable"),
+            send("Network.enable"),
+          ]);
+          this.attachments.set(tabId, new Set());
+        })().finally(() => this.attaching.delete(tabId));
+        this.attaching.set(tabId, pending);
+      }
+      await pending;
     }
-    users.add(s.id);
+    this.attachments.get(tabId)?.add(s.id);
+    this.lastUsed.set(tabId, Date.now());
   }
 
-  unrelease(tabId: number) {
-    this.released.delete(tabId);
-  }
-
-  tab(s: Session): number {
+  /** The session's current tab. After a reconnect, finds it again via the session's tab group. */
+  async tab(s: Session): Promise<number> {
+    if (s.tabId === null && !s.recovered && this.bridge.connected) {
+      s.recovered = true;
+      const found = await this.bridge.call<{ groupId: number; tabId: number } | null>("groups.find", { title: s.groupTitle }).catch(() => null);
+      if (found) {
+        s.groupId = found.groupId;
+        s.tabId = found.tabId;
+        log(`session ${s.label} found its way back to tab ${found.tabId}`);
+      }
+    }
     if (s.tabId === null) throw new Error("No tab selected yet. Use tab_open to open one, or tabs_list + tab_select to grab an existing tab.");
     return s.tabId;
   }
 
   async cdp<T = any>(s: Session, method: string, params: Record<string, unknown> = {}, timeoutMs?: number): Promise<T> {
-    const tabId = this.tab(s);
+    const tabId = await this.tab(s);
     if (!this.attachments.get(tabId)?.has(s.id)) await this.attach(s, tabId);
-    return this.bridge.call<T>("cdp", { tabId, method, params }, timeoutMs);
+    this.lastUsed.set(tabId, Date.now());
+    try {
+      return await this.bridge.call<T>("cdp", { tabId, method, params }, timeoutMs);
+    } catch (e: any) {
+      // We thought we were attached but the browser disagrees (the user just released it, or Chrome
+      // detached on its own). Forget the attachment and try once more; attach() reports a release properly.
+      if (!/not attached/i.test(String(e?.message))) throw e;
+      this.attachments.delete(tabId);
+      await this.attach(s, tabId);
+      return this.bridge.call<T>("cdp", { tabId, method, params }, timeoutMs);
+    }
   }
 
   /** Run JS in the page and hand back the value. Throws with the page's own error message. */
@@ -264,14 +364,43 @@ export class Pilot {
     return r as { x: number; y: number; width: number; height: number; pageX: number; pageY: number; tag: string; covered?: string };
   }
 
-  async waitForLoad(s: Session, trigger: () => Promise<unknown>, timeoutMs: number): Promise<"loaded" | "timeout"> {
-    const tabId = this.tab(s);
-    const loaded = this.bridge.waitForEvent(tabId, "Page.loadEventFired", timeoutMs).then(
-      () => "loaded" as const,
-      () => "timeout" as const,
+  /**
+   * Run a navigation and wait for it to land. Tracks the navigation by loaderId, so a load event from an
+   * earlier navigation can't fool it, and same-document navigations (hash changes, SPA history) return
+   * right away instead of waiting for a load event that never comes.
+   * `trigger` may return Page.navigate's result ({loaderId, errorText}).
+   */
+  async navigate(s: Session, trigger: () => Promise<any>, timeoutMs: number): Promise<"loaded" | "same-document" | "timeout"> {
+    const tabId = await this.tab(s);
+    const tree = await this.cdp(s, "Page.getFrameTree");
+    const mainId: string = tree.frameTree.frame.id;
+    const oldLoader: string = tree.frameTree.frame.loaderId;
+    let expected: string | undefined;
+    const wait = this.bridge.waitFor<"loaded" | "same-document">(
+      tabId,
+      (m, p) => {
+        if (p?.frameId !== mainId) return undefined;
+        if (m === "Page.lifecycleEvent" && p.name === "load" && p.loaderId !== oldLoader && (!expected || p.loaderId === expected)) return "loaded";
+        if (m === "Page.navigatedWithinDocument") return "same-document";
+        return undefined;
+      },
+      timeoutMs,
     );
-    await trigger();
-    return loaded;
+    try {
+      const r = await trigger();
+      if (r?.errorText) throw new Error(`Navigation failed: ${r.errorText}`);
+      if (r && "frameId" in r) {
+        if (!r.loaderId) {
+          wait.cancel();
+          return "same-document";
+        }
+        expected = r.loaderId;
+      }
+      return await wait.promise;
+    } catch (e) {
+      wait.cancel();
+      throw e;
+    }
   }
 
   async mouse(s: Session, x: number, y: number, opts: { button?: string; clickCount?: number; modifiers?: number; hoverOnly?: boolean } = {}) {
@@ -285,11 +414,12 @@ export class Pilot {
     }
   }
 
-  /** Press a key or combo like "Enter", "Control+a", "Shift+Tab", "Meta+k". */
+  /** Press a key or combo like "Enter", "Control+a", "Shift+Tab", "Meta+k", ".", "Shift+a". */
   async press(s: Session, combo: string) {
     const parts = combo.split("+").map((p) => p.trim()).filter(Boolean);
     let keyName = parts.pop() ?? "";
     if (keyName === "" && combo.endsWith("+")) keyName = "+";
+    if (combo === " ") keyName = " ";
     let modifiers = 0;
     for (const m of parts) {
       const bit = MODIFIERS[m.toLowerCase()];
@@ -303,16 +433,27 @@ export class Pilot {
       ({ code, keyCode, text } = known);
     } else if (keyName.length === 1) {
       key = keyName;
-      const upper = keyName.toUpperCase();
-      keyCode = upper.charCodeAt(0);
-      code = /[A-Z]/.test(upper) ? `Key${upper}` : /[0-9]/.test(keyName) ? `Digit${keyName}` : "";
-      // Only plain typing produces text; Control+a should select-all, not type "a".
-      text = modifiers & ~8 ? undefined : keyName;
+      if (/[a-z]/i.test(keyName)) {
+        const upper = keyName.toUpperCase();
+        code = `Key${upper}`;
+        keyCode = upper.charCodeAt(0);
+        if (modifiers & 8) key = upper; // Shift+a types "A"
+      } else if (/[0-9]/.test(keyName)) {
+        code = `Digit${keyName}`;
+        keyCode = keyName.charCodeAt(0);
+      } else if (PUNCTUATION[keyName]) {
+        [code, keyCode] = PUNCTUATION[keyName];
+      } else {
+        code = ""; // shifted symbols like ! or @: the text is what matters
+        keyCode = 0;
+      }
+      // Only plain (or shifted) typing produces text; Control+a should select-all, not type "a".
+      text = modifiers & ~8 ? undefined : key;
     } else {
       throw new Error(`Unknown key "${keyName}". Try Enter, Tab, Escape, Backspace, ArrowDown, or a single character.`);
     }
     const commands: string[] = [];
-    if (modifiers & 2 && key.toLowerCase() === "a") commands.push("selectAll");
+    if (modifiers & (2 | 4) && key.toLowerCase() === "a") commands.push("selectAll");
     await this.cdp(s, "Input.dispatchKeyEvent", { type: text ? "keyDown" : "rawKeyDown", key, code, windowsVirtualKeyCode: keyCode, modifiers, text, commands });
     await this.cdp(s, "Input.dispatchKeyEvent", { type: "keyUp", key, code, windowsVirtualKeyCode: keyCode, modifiers });
   }
@@ -321,7 +462,7 @@ export class Pilot {
   async ensureVisible(s: Session) {
     const state = await this.evaluate<string>(s, "document.visibilityState").catch(() => "visible");
     if (state !== "visible") {
-      await this.bridge.call("tabs.activate", { tabId: this.tab(s) });
+      await this.bridge.call("tabs.activate", { tabId: await this.tab(s) });
       await new Promise((r) => setTimeout(r, 250));
     }
   }

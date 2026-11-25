@@ -37,9 +37,27 @@ function findChrome() {
   throw new Error("No Chromium found. Set CHROME=/path/to/chromium");
 }
 
+for (const port of [PORT, PAGE_PORT, CDP_PORT]) {
+  const busy = await fetch(`http://127.0.0.1:${port}/`).then(() => true, (e) => e?.cause?.code !== "ECONNREFUSED");
+  if (busy) {
+    console.error(`✗ port ${port} is already in use (leftover from a crashed run?). Free it and try again.`);
+    process.exit(1);
+  }
+}
+
 const home = mkdtempSync(join(tmpdir(), "tabpilot-e2e-"));
 const env = { ...process.env, TABPILOT_HOME: home, TABPILOT_PORT: String(PORT) };
 const cleanup = [];
+// If we get killed (timeout, Ctrl+C), still tear everything down so the next run starts clean.
+for (const sig of ["SIGINT", "SIGTERM"]) {
+  process.on(sig, async () => {
+    for (const fn of cleanup.reverse()) await Promise.resolve(fn()).catch(() => {});
+    try {
+      execFileSync(process.execPath, [cli, "stop"], { env, stdio: "ignore" });
+    } catch {}
+    process.exit(130);
+  });
+}
 let failures = 0;
 
 function check(name, cond, detail = "") {
@@ -49,6 +67,17 @@ function check(name, cond, detail = "") {
 
 const textOf = (r) => r.content.map((c) => c.text ?? `[${c.type}]`).join("\n");
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// Poll until fn() returns something truthy (or time runs out). Fixed sleeps flake on busy machines.
+async function until(fn, ms = 10_000) {
+  const end = Date.now() + ms;
+  let v;
+  while (Date.now() < end) {
+    v = await fn().catch(() => undefined);
+    if (v) return v;
+    await sleep(150);
+  }
+  return v;
+}
 
 // ---- a little app to test against
 const PAGE = `<!doctype html><html><head><title>Flight Deck Test</title></head><body>
@@ -134,7 +163,7 @@ try {
   });
 
   let version;
-  for (let i = 0; i < 50 && !version; i++) {
+  for (let i = 0; i < 300 && !version; i++) {
     await sleep(200);
     version = await fetch(`http://127.0.0.1:${CDP_PORT}/json/version`).then((x) => x.json()).catch(() => null);
   }
@@ -158,7 +187,7 @@ try {
       });
       pws.send(JSON.stringify({ id, method: "Runtime.evaluate", params: { expression, awaitPromise: true, returnByValue: true } }));
     });
-  await sleep(500);
+  for (let i = 0; i < 50 && (await popupEval(`document.body.dataset.ready`)) !== "1"; i++) await sleep(100);
 
   // wrong code first: the daemon must refuse it
   await popupEval(`(async () => {
@@ -166,7 +195,7 @@ try {
     document.getElementById('code').value = 'tp-wrong-wrong-wrong-wrong';
     document.getElementById('connect').click();
   })()`);
-  await sleep(1500);
+  await until(async () => (await popupEval(`chrome.storage.local.get('status').then(s => s.status?.state)`)) === "error");
   const bad = await popupEval(`chrome.storage.local.get('status').then(s => s.status)`);
   check("wrong pairing code is rejected", bad?.state === "error" && /doesn't match/.test(bad.detail), JSON.stringify(bad));
 
@@ -210,6 +239,18 @@ try {
   await call(a, "press", { key: "Backspace" });
   echo = textOf(await call(a, "evaluate", { expression: "document.getElementById('name').value" }));
   check("press handles combos (Ctrl+A, Backspace)", echo === "", JSON.stringify(echo));
+
+  await call(a, "type", { ref: nameRef, value: "" });
+  for (const k of ["Shift+h", "i", ".", ",", "/", "-", "!"]) await call(a, "press", { key: k });
+  echo = textOf(await call(a, "evaluate", { expression: "document.getElementById('name').value" }));
+  check("press types punctuation, Shift+letter and symbols correctly", echo === "Hi.,/-!", JSON.stringify(echo));
+
+  let t1 = Date.now();
+  r = await call(a, "navigate", { url: PAGE_URL + "#cockpit" });
+  check("same-page navigation (hash/SPA) returns right away", textOf(r).startsWith("Moved (same page") && Date.now() - t1 < 8000, `${Date.now() - t1}ms ${textOf(r)}`);
+  t1 = Date.now();
+  r = await call(a, "navigate", { action: "back" });
+  check("back within the same page returns right away", Date.now() - t1 < 8000 && !textOf(r).startsWith("Still loading"), `${Date.now() - t1}ms ${textOf(r)}`);
 
   r = await call(a, "select_option", { selector: "#seat", option: "Window" });
   const seat = textOf(await call(a, "evaluate", { expression: "document.getElementById('seat').value" }));
@@ -292,7 +333,53 @@ try {
   r = await call(a, "click", { ref: "e999" });
   check("stale refs get a helpful error", r.isError && textOf(r).includes("fresh snapshot"), textOf(r));
 
-  // 8. daemon restarts mid-flight: shims and the extension both find their way back
+  // 8. the user's controls in the popup
+  await until(async () => (await popupEval(`document.querySelectorAll('#tabs li button').length`)) >= 1);
+  let deck = await popupEval(`({ tabs: [...document.querySelectorAll('#tabs li .t')].map(e => e.textContent), activity: document.getElementById('activity').textContent, deck: !document.getElementById('deck').hidden })`);
+  check("popup shows the flight deck with controlled tabs", deck.deck && deck.tabs.some((t) => t.includes("Flight Deck")), JSON.stringify(deck));
+  check("popup shows what the AI is doing", deck.activity.startsWith("last: "), deck.activity);
+
+  await popupEval(`document.getElementById('pause').click()`);
+  await until(async () => textOf(await call(a, "status")).includes("PAUSED"));
+  r = await call(a, "snapshot");
+  check("pause blocks the AI with a clear message", r.isError && textOf(r).includes("paused tabpilot"), textOf(r));
+  r = await call(a, "status");
+  check("status reports the pause", textOf(r).includes("PAUSED"), textOf(r));
+  const t0 = Date.now();
+  r = await call(a, "wait_for", { selector: "#never", timeoutMs: 8000 });
+  check("wait_for fails fast while paused instead of timing out", r.isError && Date.now() - t0 < 6000, `${Date.now() - t0}ms ${textOf(r)}`);
+  const pausedUi = await popupEval(`[document.getElementById('state').textContent, document.getElementById('pause').textContent]`);
+  check("popup shows Paused + a Resume button", pausedUi[0] === "Paused" && pausedUi[1].includes("Resume"), JSON.stringify(pausedUi));
+  await popupEval(`document.getElementById('pause').click()`);
+  await until(async () => !textOf(await call(a, "status")).includes("PAUSED"));
+  r = await call(a, "evaluate", { expression: "1 + 1" });
+  check("resume gives the controls back", textOf(r) === "2", textOf(r));
+
+  // release one tab from the popup
+  // release session B's current tab (aTab) by finding its row in the popup
+  await popupEval(`[...document.querySelectorAll('#tabs li')].find(li => !li.querySelector('.t').title.includes('?b')).querySelector('button').click()`);
+  r = await until(async () => {
+    const x = await call(b, "evaluate", { expression: "1" });
+    return x.isError ? x : undefined;
+  });
+  check("a released tab is off-limits until the user says so", r.isError && textOf(r).includes("took back tab"), textOf(r));
+  r = await call(b, "tab_select", { tabId: aTab, force: true });
+  check("tab_select force re-grabs it", textOf(r).startsWith("Now driving"), textOf(r));
+
+  // screenshots sized for Claude: retina gets scaled, files get saved
+  await call(a, "viewport", { width: 1280, height: 800, deviceScaleFactor: 2 });
+  r = await call(a, "screenshot", { save: true });
+  const png = Buffer.from(r.content[0].data, "base64");
+  const pngW = png.readUInt32BE(16);
+  const savedPath = textOf(r).match(/Saved to (\S+)/)?.[1];
+  check(`retina screenshot scaled to ≤1568px (got ${pngW}px)`, pngW <= 1568 && pngW > 1000, textOf(r));
+  check("screenshot saved to disk", !!savedPath && existsSync(savedPath), textOf(r));
+  await call(a, "evaluate", { expression: "document.body.style.height = '30000px'" });
+  r = await call(a, "screenshot", { fullPage: true });
+  check("very tall full-page shots get cropped under the 8000px limit", r.content[0].mimeType === "image/jpeg" && /Cropped at \d+px/.test(textOf(r)), textOf(r));
+  await call(a, "viewport", { reset: true });
+
+  // 9. daemon restarts mid-flight: shims and the extension both find their way back
   execFileSync(process.execPath, [cli, "restart"], { env, stdio: "ignore" });
   let back = "";
   for (let i = 0; i < 40 && !back.includes("✓ Browser connected"); i++) {
@@ -300,10 +387,12 @@ try {
     back = textOf(await call(a, "status"));
   }
   check("after a daemon restart, the shim reconnects and the extension re-pairs", back.includes("✓ Browser connected"), back);
+  r = await call(a, "evaluate", { expression: "location.href" });
+  check("the session finds its own tab again (via its tab group)", textOf(r).startsWith(PAGE_URL), textOf(r));
   r = await call(a, "tab_open", { url: PAGE_URL + "?after-restart" });
   check("and it can still fly", textOf(r).includes("Flight Deck Test"), textOf(r));
 
-  // 9. mayday
+  // 10. mayday
   await popupEval(`document.getElementById('mayday').click()`);
   await sleep(800);
   r = await call(a, "status");

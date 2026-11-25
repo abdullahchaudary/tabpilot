@@ -90,6 +90,10 @@ export class Bridge extends EventEmitter {
   private pending = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void; timer: NodeJS.Timeout }>();
   readonly recorders = new Map<number, TabRecorder>();
   browserInfo: { userAgent?: string; extensionVersion?: string; connectedAt?: number; remote?: string } = {};
+  /** The user hit Pause in the extension. The extension enforces it; we just fail fast and say why. */
+  paused = false;
+  /** Random id the extension keeps per browser run. A new one means every tab id we know is stale. */
+  private instanceId: string | null = null;
 
   constructor(private cfg: Config) {
     super();
@@ -126,26 +130,30 @@ export class Bridge extends EventEmitter {
 
     const handshakeTimer = setTimeout(() => stage !== "open" && fail(4000, "handshake timeout"), 10_000);
 
-    ws.on("message", async (data) => {
-      const text = data.toString();
+    ws.on("message", (data) => {
+      onFrame(data.toString()).catch((e) => fail(4000, `handshake error: ${e?.message ?? e}`));
+    });
+
+    const onFrame = async (text: string) => {
       if (stage === "hello") {
         let hello: any;
         try {
           hello = JSON.parse(text);
-        } catch {
+        } catch {}
+        if (!hello || typeof hello !== "object" || hello.t !== "hello" || typeof hello.nonce !== "string" || hello.nonce.length > 64) {
           return fail(4000, "bad hello");
         }
-        if (hello.t !== "hello" || typeof hello.nonce !== "string") return fail(4000, "bad hello");
         if (hello.v !== PROTOCOL_VERSION) return fail(4002, `protocol mismatch: daemon speaks v${PROTOCOL_VERSION}`);
         clientNonce = hello.nonce;
+        stage = "auth"; // before any await, so a second frame can't re-enter this branch
         const keys = await deriveKeys(this.cfg.pairingCode, clientNonce, serverNonce);
         channel = new Channel(
           keys.s2c,
           keys.c2s,
-          (frame) => ws.send(frame),
+          (frame) => ws.readyState === ws.OPEN && ws.send(frame),
           (msg) => {
             if (stage === "auth") {
-              if (msg.t !== "auth") return fail(4001, "pairing code mismatch");
+              if (msg?.t !== "auth") return fail(4001, "pairing code mismatch");
               stage = "open";
               clearTimeout(handshakeTimer);
               this.adopt(ws, channel!, remote, msg);
@@ -154,15 +162,16 @@ export class Bridge extends EventEmitter {
               this.handle(msg);
             }
           },
-          // A frame that won't decrypt means a wrong pairing code (during auth) or tampering (later).
-          () => fail(4001, stage === "auth" ? "pairing code mismatch" : "bad frame"),
+          // Can't decrypt: during auth that means a wrong pairing code (sticky in the extension);
+          // later it means corruption or tampering (the extension just reconnects).
+          () => fail(stage === "auth" ? 4001 : 4004, stage === "auth" ? "pairing code mismatch" : "bad frame"),
         );
-        stage = "auth";
         ws.send(JSON.stringify({ t: "challenge", nonce: serverNonce }));
         return;
       }
+      if (stage === "auth" && !channel) return; // still deriving keys; the extension won't send before the challenge anyway
       channel?.receive(text);
-    });
+    };
 
     ws.on("close", () => {
       clearTimeout(handshakeTimer);
@@ -181,6 +190,13 @@ export class Bridge extends EventEmitter {
     }
     this.socket = ws;
     this.channel = channel;
+    if (auth.instanceId !== this.instanceId) {
+      // Different browser, or the same browser restarted: tab ids got reused or recycled. Forget them all.
+      if (this.instanceId !== null) log("browser instance changed; forgetting old tab state");
+      this.recorders.clear();
+      this.emit("newBrowser");
+      this.instanceId = auth.instanceId ?? null;
+    }
     this.browserInfo = { userAgent: auth.userAgent, extensionVersion: auth.version, connectedAt: Date.now(), remote };
     log(`extension paired from ${remote} (${auth.userAgent ?? "unknown browser"})`);
     this.emit("connected");
@@ -189,6 +205,7 @@ export class Bridge extends EventEmitter {
   private drop(reason: string) {
     this.socket = null;
     this.channel = null;
+    this.paused = false;
     for (const [, p] of this.pending) {
       clearTimeout(p.timer);
       p.reject(new Error(`Browser disconnected (${reason}).`));
@@ -212,6 +229,11 @@ export class Bridge extends EventEmitter {
       case "cdp":
         this.record(msg.tabId, msg.method, msg.params);
         this.emit("cdp", msg.tabId, msg.method, msg.params);
+        break;
+      case "paused":
+        this.paused = !!msg.paused;
+        log(this.paused ? "user paused the AI" : "user resumed the AI");
+        this.emit("paused", this.paused);
         break;
       case "detached":
         this.emit("detached", msg.tabId, msg.reason);
@@ -307,35 +329,58 @@ export class Bridge extends EventEmitter {
         ),
       );
     }
+    if (this.paused && method !== "debugger.detach") {
+      return Promise.reject(
+        new Error("⏸ The user paused tabpilot from the browser. Stop here and wait for them to resume it (or ask them what's up). Don't retry in a loop."),
+      );
+    }
     const id = this.nextId++;
     return new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
-        reject(new Error(`Browser didn't answer ${method} within ${Math.round(timeoutMs / 1000)}s.`));
+        const secs = Math.round(timeoutMs / 1000);
+        const what = method === "cdp" ? String(params.method) : method;
+        reject(
+          new Error(
+            what === "Page.navigate"
+              ? `The site didn't respond within ${secs}s (Chrome is still waiting for it). Is the server running and reachable from the browser's machine?`
+              : `Chrome didn't finish ${what} within ${secs}s. The page may be hung, stuck loading, or busy; try navigate with action "reload", or check the console.`,
+          ),
+        );
       }, timeoutMs);
       this.pending.set(id, { resolve, reject, timer });
       channel.send({ id, method, params });
     });
   }
 
-  /** Wait for a specific CDP event on a tab. Call before triggering the thing that fires it. */
-  waitForEvent(tabId: number, method: string, timeoutMs: number, predicate: (p: any) => boolean = () => true): Promise<any> {
-    return new Promise((resolve, reject) => {
+  /**
+   * Wait for the first CDP event on a tab that `match` returns a value for. Returns the promise plus a cancel()
+   * so callers never leave listeners behind. Call before triggering the thing that fires it.
+   */
+  waitFor<T>(tabId: number, match: (method: string, params: any) => T | undefined, timeoutMs: number) {
+    let cancel: () => void = () => {};
+    const promise = new Promise<T | "timeout">((resolve) => {
       const onEvent = (t: number, m: string, p: any) => {
-        if (t === tabId && m === method && predicate(p)) {
-          cleanup();
-          resolve(p);
+        if (t !== tabId) return;
+        const v = match(m, p);
+        if (v !== undefined) {
+          cancel();
+          resolve(v);
         }
       };
-      const timer = setTimeout(() => {
-        cleanup();
-        reject(new Error(`timeout waiting for ${method}`));
-      }, timeoutMs);
-      const cleanup = () => {
+      const onGone = () => {
+        cancel();
+        resolve("timeout");
+      };
+      const timer = setTimeout(onGone, timeoutMs);
+      cancel = () => {
         clearTimeout(timer);
         this.off("cdp", onEvent);
+        this.off("disconnected", onGone);
       };
       this.on("cdp", onEvent);
+      this.on("disconnected", onGone);
     });
+    return { promise, cancel: () => cancel() };
   }
 }

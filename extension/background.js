@@ -2,11 +2,17 @@
 // Dials the daemon, pairs over an encrypted channel, then does what it's told:
 // tab management plus raw CDP via chrome.debugger. All the smarts live in the daemon;
 // this side stays small so you rarely need to reload the extension.
+//
+// The user is always in charge from here: pause/resume, release a single tab,
+// disconnect, or MAYDAY (release everything + hang up). Pause is enforced HERE,
+// not in the daemon, so a paused browser stays paused no matter what the other end does.
 
 import { Channel, deriveKeys, PROTOCOL_VERSION, randomNonce } from "./wire.js";
 
 const VERSION = chrome.runtime.getManifest().version;
 const DEFAULT_SERVER = "ws://127.0.0.1:7337/ext";
+const PAUSED_MSG =
+  "⏸ The user paused tabpilot from the browser. Stop here and wait for them to resume it (or ask them what's up). Don't retry in a loop.";
 
 // CDP events the daemon cares about (console, network, page lifecycle, dialogs).
 const FORWARD = new Set([
@@ -21,22 +27,88 @@ const FORWARD = new Set([
   "Page.domContentEventFired",
   "Page.frameNavigated",
   "Page.javascriptDialogOpening",
+  "Page.navigatedWithinDocument",
+  "Page.lifecycleEvent", // filtered to "load" below; the rest is noise
 ]);
 
 let ws = null;
 let channel = null;
+let connectQueue = Promise.resolve();
 let retryDelay = 1000;
 let retryTimer = null;
 let heartbeat = null;
+let paused = false;
+// Tabs WE attached to, and tabs the user took back. Kept in session storage so they survive the service worker
+// being put to sleep (Chrome keeps the debugger attached even when our worker restarts), but not a browser restart.
 const attached = new Set();
+const released = new Set();
+let instanceId = null;
+const ready = chrome.storage.session.get(["attached", "released", "instanceId"]).then(async (s) => {
+  (s.attached ?? []).forEach((id) => attached.add(id));
+  (s.released ?? []).forEach((id) => released.add(id));
+  instanceId = s.instanceId ?? crypto.randomUUID();
+  await chrome.storage.session.set({ instanceId });
+});
+function persistTabs() {
+  chrome.storage.session.set({ attached: [...attached], released: [...released] });
+  scheduleFlightUpdate();
+}
 
-// ---------------------------------------------------------------- status
+// ---------------------------------------------------------------- status + flight info for the popup
+
+let lastState = "off";
 
 async function setStatus(state, detail = "") {
-  await chrome.storage.local.set({ status: { state, detail, at: Date.now(), tabs: attached.size } });
-  const badge = { connected: ["ON", "#2f9e44"], connecting: ["…", "#868e96"], error: ["!", "#e03131"], off: ["", "#868e96"] }[state];
-  chrome.action.setBadgeText({ text: badge[0] });
-  chrome.action.setBadgeBackgroundColor({ color: badge[1] });
+  lastState = state;
+  await chrome.storage.local.set({ status: { state, detail, at: Date.now() } });
+  paintBadge();
+}
+
+function paintBadge() {
+  const [text, color] =
+    lastState === "connected" && paused
+      ? ["II", "#f08c00"]
+      : { connected: ["ON", "#2f9e44"], connecting: ["…", "#868e96"], error: ["!", "#e03131"], off: ["", "#868e96"] }[lastState];
+  chrome.action.setBadgeText({ text });
+  chrome.action.setBadgeBackgroundColor({ color });
+}
+
+// What the agent is doing right now, in words. Written at most every 300ms so we don't thrash storage.
+let activity = null;
+let flightTimer = null;
+function describe(method, params) {
+  if (method === "cdp") {
+    const m = params.method;
+    if (m === "Input.dispatchMouseEvent") return params.params?.type === "mouseWheel" ? "scrolling" : params.params?.type === "mouseMoved" ? "moving the mouse" : "clicking";
+    return (
+      {
+        "Page.navigate": "navigating",
+        "Page.reload": "reloading",
+        "Page.navigateToHistoryEntry": "going back/forward",
+        "Page.captureScreenshot": "taking a screenshot",
+        "Input.insertText": "typing",
+        "Input.dispatchKeyEvent": "pressing keys",
+        "Runtime.evaluate": "reading the page",
+        "Network.getResponseBody": "inspecting network traffic",
+        "Network.getRequestPostData": "inspecting network traffic",
+        "Emulation.setDeviceMetricsOverride": "resizing the viewport",
+      }[m] ?? m
+    );
+  }
+  return { "tabs.create": "opening a tab", "tabs.close": "closing a tab", "tabs.activate": "switching tabs", "debugger.attach": "taking the controls" }[method];
+}
+
+function scheduleFlightUpdate() {
+  if (flightTimer) return;
+  flightTimer = setTimeout(async () => {
+    flightTimer = null;
+    const tabs = [];
+    for (const id of attached) {
+      const t = await chrome.tabs.get(id).catch(() => null);
+      if (t) tabs.push({ id, title: t.title || t.url || "(loading)", url: t.url ?? "" });
+    }
+    await chrome.storage.local.set({ flight: { tabs, activity, paused } });
+  }, 300);
 }
 
 async function settings() {
@@ -46,7 +118,15 @@ async function settings() {
 
 // ---------------------------------------------------------------- connection
 
-async function connect(force = false) {
+// Several things can ask to connect at once (alarm, popup, startup). They take turns, and each one
+// re-checks the socket, so we never open two. A forced connect (the Connect button) is never swallowed.
+function connect(force = false) {
+  connectQueue = connectQueue.then(() => openSocket(force)).catch(() => {});
+  return connectQueue;
+}
+
+async function openSocket(force) {
+  await ready;
   const { server, pairingCode, enabled } = await settings();
   if (!enabled || !pairingCode) return setStatus("off");
   // After a hard failure (wrong code, version mismatch) wait for the user instead of hammering the daemon.
@@ -83,9 +163,9 @@ async function connect(force = false) {
         keys.s2c,
         (frame) => socket.readyState === WebSocket.OPEN && socket.send(frame),
         onMessage,
-        () => socket.close(4001, "decrypt failed"),
+        () => socket.close(4004, "decrypt failed"),
       );
-      channel.send({ t: "auth", userAgent: navigator.userAgent, version: VERSION });
+      channel.send({ t: "auth", userAgent: navigator.userAgent, version: VERSION, instanceId });
       return;
     }
     channel.receive(ev.data);
@@ -96,13 +176,14 @@ async function connect(force = false) {
     ws = null;
     channel = null;
     clearInterval(heartbeat);
+    await releaseAll(); // nobody's flying anymore, so take down Chrome's debugging bar
     if (ev.code === 4001) return setStatus("error", "Pairing code doesn't match. Run `tabpilot pair` and paste the code again.");
     if (ev.code === 4002) return setStatus("error", `Version mismatch: ${ev.reason}. Update the extension or the daemon.`);
-    if (ev.code === 4003) return setStatus("error", "Another browser connected to this daemon and took over.");
+    if (ev.code === 4003) return setStatus("error", "Another browser connected to this daemon and took over. Hit Connect to take it back.");
     const { enabled } = await settings();
     if (!enabled) return setStatus("off");
     await setStatus("connecting", `Daemon unreachable, retrying in ${Math.round(retryDelay / 1000)}s. Is it running? (\`tabpilot start\`)`);
-    retryTimer = setTimeout(connect, retryDelay);
+    retryTimer = setTimeout(() => connect(), retryDelay);
     retryDelay = Math.min(retryDelay * 2, 30_000);
   };
 
@@ -116,13 +197,21 @@ async function disconnect() {
   channel = null;
   clearInterval(heartbeat);
   if (s) s.close(1000, "user disconnected");
+  await releaseAll();
   await setStatus("off");
+}
+
+async function releaseAll() {
+  for (const tabId of attached) await chrome.debugger.detach({ tabId }).catch(() => {});
+  attached.clear();
+  persistTabs();
 }
 
 function onMessage(msg) {
   if (msg.t === "welcome") {
     retryDelay = 1000;
     setStatus("connected", `daemon v${msg.daemonVersion ?? "?"}`);
+    channel.send({ event: "paused", paused }); // the daemon forgets this across reconnects; remind it
     // Chrome keeps a service worker alive while its WebSocket is busy. A ping every 20s keeps it busy.
     clearInterval(heartbeat);
     heartbeat = setInterval(() => channel?.send({ t: "ping" }), 20_000);
@@ -132,7 +221,14 @@ function onMessage(msg) {
 }
 
 async function handle({ id, method, params }) {
+  // Paused means hands off. Letting go of a tab is the one thing that's always allowed.
+  if (paused && method !== "debugger.detach") return channel?.send({ id, error: PAUSED_MSG });
   try {
+    const label = describe(method, params ?? {});
+    if (label) {
+      activity = { label, tabId: params?.tabId ?? null, at: Date.now() };
+      scheduleFlightUpdate();
+    }
     const result = await (handlers[method] ?? unknown(method))(params ?? {});
     channel?.send({ id, result: result ?? null });
   } catch (e) {
@@ -144,7 +240,7 @@ const unknown = (method) => () => {
   throw new Error(`Extension doesn't know "${method}". Is it older than the daemon? Reload it from chrome://extensions.`);
 };
 
-// ---------------------------------------------------------------- commands
+// ---------------------------------------------------------------- commands from the daemon
 
 const tabInfo = (t) => ({ id: t.id, windowId: t.windowId, url: t.url ?? t.pendingUrl ?? "", title: t.title ?? "", active: t.active, groupId: t.groupId });
 
@@ -188,83 +284,154 @@ const handlers = {
     await chrome.windows.update(t.windowId, { focused: true });
   },
 
-  "debugger.attach": async ({ tabId }) => {
+  "debugger.attach": async ({ tabId, force = false }) => {
+    // The user's "hands off" is enforced here, in their browser, not just in the daemon.
+    if (released.has(tabId) && !force) {
+      throw new Error(`The user took back tab ${tabId}. Ask them before grabbing it again, then call tab_select with force: true.`);
+    }
+    released.delete(tabId);
     try {
       await chrome.debugger.attach({ tabId }, "1.3");
     } catch (e) {
       const msg = String(e?.message ?? e);
-      if (!/already attached/i.test(msg)) {
-        if (/cannot access|chrome:\/\/|chrome-extension:\/\//i.test(msg)) throw new Error("Chrome doesn't let extensions debug this page (chrome://, the Web Store, other extensions). Pick a regular web page.");
-        throw e;
-      }
+      if (/already attached/i.test(msg)) {
+        if (!attached.has(tabId)) throw new Error("Another extension is already debugging this tab. Turn it off for this tab, or pick another tab.");
+      } else if (/cannot access|chrome:\/\/|chrome-extension:\/\//i.test(msg)) {
+        throw new Error("Chrome doesn't let extensions debug this page (chrome://, the Web Store, other extensions). Pick a regular web page.");
+      } else throw e;
     }
     attached.add(tabId);
-    setStatus("connected", "");
+    persistTabs();
   },
 
   "debugger.detach": async ({ tabId }) => {
     attached.delete(tabId);
     await chrome.debugger.detach({ tabId }).catch(() => {});
-    setStatus("connected", "");
+    persistTabs();
   },
 
-  cdp: ({ tabId, method, params }) => chrome.debugger.sendCommand({ tabId }, method, params ?? {}),
+  // Find a session's tab group by title and return its most recently used tab.
+  "groups.find": async ({ title }) => {
+    const [group] = await chrome.tabGroups.query({ title });
+    if (!group) return null;
+    const tabs = await chrome.tabs.query({ groupId: group.id });
+    tabs.sort((a, b) => (b.lastAccessed ?? 0) - (a.lastAccessed ?? 0));
+    return tabs.length ? { groupId: group.id, tabId: tabs[0].id } : null;
+  },
+
+  cdp: ({ tabId, method, params }) => {
+    if (released.has(tabId)) throw new Error(`The user took back tab ${tabId}. Ask them before grabbing it again, then call tab_select with force: true.`);
+    if (!attached.has(tabId)) throw new Error("tabpilot: not attached");
+    return chrome.debugger.sendCommand({ tabId }, method, params ?? {});
+  },
 };
 
 // ---------------------------------------------------------------- browser events -> daemon
 
 chrome.debugger.onEvent.addListener((source, method, params) => {
-  if (source.tabId != null && FORWARD.has(method)) channel?.send({ event: "cdp", tabId: source.tabId, method, params });
+  if (source.tabId == null || !FORWARD.has(method)) return;
+  if (method === "Page.lifecycleEvent" && params.name !== "load") return;
+  channel?.send({ event: "cdp", tabId: source.tabId, method, params });
 });
 
 chrome.debugger.onDetach.addListener((source, reason) => {
   if (source.tabId == null) return;
   attached.delete(source.tabId);
+  if (reason === "canceled_by_user") released.add(source.tabId);
+  persistTabs();
   channel?.send({ event: "detached", tabId: source.tabId, reason });
-  if (channel) setStatus("connected", "");
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   attached.delete(tabId);
+  released.delete(tabId);
+  persistTabs();
   channel?.send({ event: "tabRemoved", tabId });
 });
 
-// ---------------------------------------------------------------- popup + lifecycle
+chrome.tabs.onUpdated.addListener((tabId, change) => {
+  if (attached.has(tabId) && (change.title || change.url)) scheduleFlightUpdate();
+});
 
+// ---------------------------------------------------------------- the user's controls
+
+async function setPaused(value) {
+  paused = value;
+  await chrome.storage.local.set({ paused });
+  channel?.send({ event: "paused", paused });
+  paintBadge();
+  scheduleFlightUpdate();
+}
+
+// Let go of one tab. The daemon marks it released, so the agent has to ask before grabbing it again.
+async function release(tabId) {
+  attached.delete(tabId);
+  released.add(tabId);
+  await chrome.debugger.detach({ tabId }).catch(() => {});
+  persistTabs();
+  channel?.send({ event: "detached", tabId, reason: "released_by_user" });
+}
+
+// Kill switch: let go of every tab, hang up, and stay off until the user reconnects.
 async function mayday() {
-  // Kill switch: let go of every tab, hang up, and stay off until the user reconnects.
-  for (const target of await chrome.debugger.getTargets()) {
-    if (target.attached && target.tabId != null) await chrome.debugger.detach({ tabId: target.tabId }).catch(() => {});
-  }
-  attached.clear();
   await chrome.storage.local.set({ enabled: false });
-  await disconnect();
+  await disconnect(); // releases every tab we hold
 }
 
 chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
   (async () => {
-    if (msg.cmd === "connect") {
-      await chrome.storage.local.set({ enabled: true });
-      retryDelay = 1000;
-      if (ws) await disconnect();
-      await chrome.storage.local.set({ enabled: true });
-      await connect(true);
-    } else if (msg.cmd === "disconnect") {
-      await chrome.storage.local.set({ enabled: false });
-      await disconnect();
-    } else if (msg.cmd === "wake") {
-      await connect();
-    } else if (msg.cmd === "mayday") {
-      await mayday();
+    switch (msg.cmd) {
+      case "connect":
+        retryDelay = 1000;
+        if (ws) await disconnect();
+        await chrome.storage.local.set({ enabled: true });
+        await connect(true);
+        break;
+      case "disconnect":
+        await chrome.storage.local.set({ enabled: false });
+        await disconnect();
+        break;
+      case "wake":
+        await connect();
+        scheduleFlightUpdate();
+        break;
+      case "pause":
+        await setPaused(true);
+        break;
+      case "resume":
+        await setPaused(false);
+        break;
+      case "release":
+        await release(msg.tabId);
+        break;
+      case "focus":
+        await handlers["tabs.activate"]({ tabId: msg.tabId }).catch(() => {});
+        break;
+      case "mayday":
+        await mayday();
+        break;
     }
     reply({ ok: true });
   })();
   return true;
 });
 
+// Keyboard shortcuts (rebind at chrome://extensions/shortcuts).
+chrome.commands.onCommand.addListener((command) => {
+  if (command === "toggle-pause") setPaused(!paused);
+  if (command === "mayday") mayday();
+});
+
+// ---------------------------------------------------------------- lifecycle
+
 // Service workers get killed when idle. The alarm wakes us up to reconnect if that happened.
 chrome.alarms.create("tabpilot-keepalive", { periodInMinutes: 0.5 });
 chrome.alarms.onAlarm.addListener((a) => a.name === "tabpilot-keepalive" && connect());
 chrome.runtime.onStartup.addListener(() => connect());
 chrome.runtime.onInstalled.addListener(() => connect());
-connect();
+
+// Restore pause state (it survives service worker restarts and browser restarts) before connecting.
+chrome.storage.local.get("paused").then((s) => {
+  paused = !!s.paused;
+  connect();
+});

@@ -14,6 +14,7 @@ so you're building an app with Claude. it writes the code, runs the tests, and t
 nah. tabpilot gives Claude the stick. it opens your app in your actual browser, clicks through it like a user would, reads the console and network tab, sees what broke, and fixes it. you just watch it fly.
 
 - 🛫 **your real browser.** your Chrome/Edge/Brave, your profile, your logins. no headless robot browser with its own sandbox you gotta babysit.
+- 👀 **it can actually see.** screenshots come straight back to Claude as images it can look at. layout bugs, broken styles, "why is this button purple", all of it. retina screens get sized down so nothing gets rejected.
 - 🔎 **full debug access.** console logs, uncaught errors, CSP/CORS warnings, every network request with headers and bodies, plus raw Chrome DevTools Protocol if you want to get weird.
 - 🧑‍✈️ **many pilots, one plane.** run 5 Claude sessions at once and they all share one browser without fighting. each session gets its own color-coded tab group.
 - 🌍 **remote-friendly.** Claude on a server, browser on your laptop? one SSH command. or LAN mode with end-to-end encryption. no cloud relay, no accounts, no servers we run.
@@ -109,6 +110,18 @@ ssh -L 7337:127.0.0.1:7337 you@devbox
 
 leave that open, and the extension connects to `ws://127.0.0.1:7337/ext` like it's all local. that's it. LAN mode and Tailscale are in [docs/remote.md](docs/remote.md).
 
+## you're still the captain
+
+the extension popup is your cockpit. click the paper plane anytime:
+
+- **⏸ Pause AI**: the AI can't touch anything until you hit resume. it gets told you paused it, so it waits instead of hammering. shortcut: `Alt+Shift+P`
+- **live activity**: see what it's doing right now ("last: clicking · Checkout · 2s ago")
+- **tabs under control**: every tab it's flying. click one to jump to it, hit **release** to take it back. Claude has to ask you before grabbing a released tab again
+- **Disconnect**: hang up and let go of every tab
+- **MAYDAY**: big red button. releases everything, disconnects, and stays off until you reconnect. shortcut: `Alt+Shift+X`
+
+rebind the shortcuts at `chrome://extensions/shortcuts`.
+
 ## cabin safety
 
 this thing can drive a logged-in browser, so it's locked down by default:
@@ -119,7 +132,8 @@ this thing can drive a logged-in browser, so it's locked down by default:
 - only the tabpilot extension can connect. web pages get bounced
 - the MCP endpoint is localhost-only, *always*, even in LAN mode
 - Chrome shows a "tabpilot started debugging this browser" bar whenever it's attached. hit **Cancel** and you've got the controls back, and Claude won't grab that tab again without asking
-- big red **MAYDAY** button in the popup lets go of every tab and hangs up
+- pause, per-tab release and MAYDAY are enforced *inside the extension*, so they hold no matter what the AI side does
+- tabs nobody's touched in 15 minutes get let go automatically, so the debugging bar doesn't hang around forever
 - optional allow-list so it only goes to the sites you want
 
 real talk: use a separate browser profile for agent stuff if your main one is logged into your bank. the full rundown is in [docs/security.md](docs/security.md).
@@ -152,7 +166,7 @@ then hit the reload icon on the extension in `chrome://extensions`.
 
 ## hacking on it
 
-[CONTRIBUTING.md](CONTRIBUTING.md). tl;dr `npm test` for the fast stuff, `npm run e2e` spins up a real Chromium with the extension and flies a full test mission.
+[CONTRIBUTING.md](CONTRIBUTING.md). tl;dr `npm test` for the fast stuff, `npm run e2e` spins up a real Chromium with the extension and flies a full test mission, and `node scripts/claude-smoke.mjs` makes real Claude read a code that only exists in a screenshot.
 
 ## license
 
