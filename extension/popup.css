@@ -1,0 +1,46 @@
+:root {
+  --bg: #0d1117; --panel: #161b22; --line: #2a313c; --text: #e6edf3; --muted: #8b949e;
+  --accent: #4dabf7; --ok: #40c057; --warn: #fab005; --bad: #fa5252;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  width: 320px; margin: 0; padding: 14px; background: var(--bg); color: var(--text);
+  font: 13px/1.4 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+header { display: flex; gap: 10px; align-items: center; margin-bottom: 12px; }
+h1 { font-size: 16px; margin: 0; letter-spacing: .02em; }
+.tag { margin: 0; color: var(--muted); font-size: 11px; }
+.status {
+  display: flex; gap: 10px; align-items: flex-start; padding: 10px; margin-bottom: 12px;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+}
+.status small { display: block; color: var(--muted); word-break: break-word; }
+.light { width: 10px; height: 10px; margin-top: 4px; border-radius: 50%; background: var(--muted); flex: none; }
+.status[data-state="connected"] .light { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+.status[data-state="connecting"] .light { background: var(--warn); animation: blink 1s infinite; }
+.status[data-state="error"] .light { background: var(--bad); }
+@keyframes blink { 50% { opacity: .3; } }
+label { display: block; margin-bottom: 10px; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .05em; }
+.hint { text-transform: none; letter-spacing: 0; float: right; }
+code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--text); }
+input {
+  display: block; width: 100%; margin-top: 4px; padding: 7px 9px; border-radius: 6px;
+  border: 1px solid var(--line); background: var(--panel); color: var(--text);
+  font: 12px ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+input:focus { outline: none; border-color: var(--accent); }
+.row { display: flex; gap: 6px; align-items: end; }
+.row input { flex: 1; }
+button { cursor: pointer; border-radius: 6px; padding: 7px 12px; font: inherit; border: 1px solid var(--line); }
+.primary { background: var(--accent); border-color: var(--accent); color: #04121f; font-weight: 600; }
+.ghost { background: transparent; color: var(--text); }
+.actions { display: flex; gap: 8px; margin: 4px 0 12px; }
+.actions .primary { flex: 1; }
+.mayday {
+  width: 100%; background: transparent; color: var(--bad); border-color: #5c2b2b;
+  font-weight: 700; letter-spacing: .04em; font-size: 11px;
+}
+.mayday:hover { background: #2b1414; }
+footer { margin-top: 12px; color: var(--muted); font-size: 11px; text-align: center; }
+a { color: var(--accent); }

@@ -1,0 +1,44 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <header>
+    <img src="icons/48.png" alt="" width="28" height="28" />
+    <div>
+      <h1>tabpilot</h1>
+      <p class="tag">hand your AI the controls</p>
+    </div>
+  </header>
+
+  <section class="status" id="status">
+    <span class="light"></span>
+    <div>
+      <strong id="state">Off</strong>
+      <small id="detail">Paste your pairing code and connect.</small>
+    </div>
+  </section>
+
+  <label>Daemon address
+    <input id="server" spellcheck="false" placeholder="ws://127.0.0.1:7337/ext" />
+  </label>
+  <label>Pairing code <span class="hint">run <code>tabpilot pair</code></span>
+    <div class="row">
+      <input id="code" type="password" spellcheck="false" autocomplete="off" placeholder="tp-xxxxx-xxxxx-xxxxx-xxxxx" />
+      <button id="reveal" class="ghost" title="Show / hide">👁</button>
+    </div>
+  </label>
+
+  <div class="actions">
+    <button id="connect" class="primary">Connect</button>
+    <button id="disconnect" class="ghost">Disconnect</button>
+  </div>
+
+  <button id="mayday" class="mayday" title="Detach from every tab and disconnect">MAYDAY: release all tabs</button>
+
+  <footer>v<span id="version"></span> · <a href="https://github.com/abdullahchaudary/tabpilot" target="_blank">docs</a></footer>
+  <script src="popup.js" type="module"></script>
+</body>
+</html>

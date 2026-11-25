@@ -1,0 +1,48 @@
+{
+  "name": "tabpilot",
+  "version": "0.1.0",
+  "description": "MCP server + browser extension that hands Claude Code (or any MCP client) the controls of your real browser.",
+  "type": "module",
+  "bin": {
+    "tabpilot": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "extension"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json && chmod +x dist/cli.js",
+    "prepare": "npm run build",
+    "dev": "tsc -p tsconfig.json --watch",
+    "test": "npm run build && node --test test/*.test.mjs",
+    "e2e": "npm run build && node scripts/e2e.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/abdullahchaudary/tabpilot.git"
+  },
+  "keywords": [
+    "mcp",
+    "claude",
+    "claude-code",
+    "browser",
+    "automation",
+    "chrome-extension",
+    "cdp",
+    "devtools"
+  ],
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "ws": "^8.23.0",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^24.19.2",
+    "@types/ws": "^8.18.2",
+    "typescript": "^5.9.3"
+  }
+}
