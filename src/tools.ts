@@ -359,20 +359,42 @@ export function createMcpServer(pilot: Pilot, s: Session): McpServer {
     },
     async ({ ref, selector, text: byText, value, clear, submit }) => {
       const hasTarget = !!(ref || selector || byText);
-      if (hasTarget) {
-        const box = await pilot.locate(s, { ref, selector, text: byText });
-        await pilot.mouse(s, box.x, box.y);
+      const fieldText = `(() => { const el = document.activeElement; if (!el || el === document.body) return null; return 'value' in el ? String(el.value) : el.isContentEditable ? el.innerText : null; })()`;
+      const attempt = async () => {
+        if (hasTarget) {
+          const box = await pilot.locate(s, { ref, selector, text: byText });
+          await pilot.mouse(s, box.x, box.y);
+        }
+        if (clear ?? hasTarget) {
+          await pilot.evaluate(
+            s,
+            `(() => { const el = document.activeElement; if (!el) return; if (typeof el.select === 'function') el.select(); else if (el.isContentEditable) document.execCommand('selectAll'); })()`,
+          );
+          if (value === "") await pilot.press(s, "Backspace");
+        }
+        if (value) await pilot.cdp(s, "Input.insertText", { text: value });
+      };
+      await attempt();
+      // Pages that are still booting (hydration) can wipe or steal the field right after we type.
+      // Check it stuck, and give it one more go if it didn't.
+      let note = "";
+      if (value && hasTarget) {
+        const landed = async () => {
+          const t = await pilot.evaluate<string | null>(s, fieldText).catch(() => null);
+          return t === null || t.includes(value);
+        };
+        await new Promise((r) => setTimeout(r, 150));
+        if (!(await landed())) {
+          await new Promise((r) => setTimeout(r, 500));
+          await attempt();
+          await new Promise((r) => setTimeout(r, 150));
+          note = (await landed())
+            ? " (the page cleared the field the first time, so I typed it again)"
+            : ". Heads up: the field doesn't show the text. The page may have reset it; take a snapshot and check";
+        }
       }
-      if (clear ?? hasTarget) {
-        await pilot.evaluate(
-          s,
-          `(() => { const el = document.activeElement; if (!el) return; if (typeof el.select === 'function') el.select(); else if (el.isContentEditable) document.execCommand('selectAll'); })()`,
-        );
-        if (value === "") await pilot.press(s, "Backspace");
-      }
-      if (value) await pilot.cdp(s, "Input.insertText", { text: value });
       if (submit) await pilot.press(s, "Enter");
-      return text(`Typed ${value.length} chars${submit ? " and hit Enter" : ""}.`);
+      return text(`Typed ${value.length} chars${submit ? " and hit Enter" : ""}${note}.`);
     },
   );
 

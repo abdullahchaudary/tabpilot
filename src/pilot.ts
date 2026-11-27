@@ -376,25 +376,38 @@ export class Pilot {
     const mainId: string = tree.frameTree.frame.id;
     const oldLoader: string = tree.frameTree.frame.loaderId;
     let expected: string | undefined;
+    // The old page can pushState on its way out (Google does), which fires navigatedWithinDocument
+    // while the real cross-document navigation is still in flight. So don't trust that event until
+    // we know what kind of navigation this is.
+    let triggered = false;
+    let sawSameDoc = false;
     const wait = this.bridge.waitFor<"loaded" | "same-document">(
       tabId,
       (m, p) => {
         if (p?.frameId !== mainId) return undefined;
         if (m === "Page.lifecycleEvent" && p.name === "load" && p.loaderId !== oldLoader && (!expected || p.loaderId === expected)) return "loaded";
-        if (m === "Page.navigatedWithinDocument") return "same-document";
+        if (m === "Page.navigatedWithinDocument") {
+          if (!triggered) sawSameDoc = true;
+          else if (!expected) return "same-document";
+        }
         return undefined;
       },
       timeoutMs,
     );
     try {
       const r = await trigger();
+      triggered = true;
       if (r?.errorText) throw new Error(`Navigation failed: ${r.errorText}`);
       if (r && "frameId" in r) {
+        // Page.navigate tells us directly: a loaderId means a new document is coming.
         if (!r.loaderId) {
           wait.cancel();
           return "same-document";
         }
         expected = r.loaderId;
+      } else if (sawSameDoc) {
+        wait.cancel();
+        return "same-document";
       }
       return await wait.promise;
     } catch (e) {
