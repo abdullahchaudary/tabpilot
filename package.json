@@ -1,6 +1,6 @@
 {
   "name": "tabpilot",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "MCP server + browser extension that hands Claude Code (or any MCP client) the controls of your real browser.",
   "type": "module",
   "bin": {
