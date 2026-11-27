@@ -379,6 +379,32 @@ try {
   check("very tall full-page shots get cropped under the 8000px limit", r.content[0].mimeType === "image/jpeg" && /Cropped at \d+px/.test(textOf(r)), textOf(r));
   await call(a, "viewport", { reset: true });
 
+  // 8b. lessons from flying a real browser
+  r = await call(a, "navigate", { url: `localhost:${PAGE_PORT}/?local` });
+  check("bare localhost:port gets http:// (not mistaken for a URL scheme)", textOf(r).startsWith("Loaded") && textOf(r).includes("localhost"), textOf(r));
+  r = await call(a, "navigate", { url: "chrome://settings" });
+  check("navigate refuses chrome:// pages up front", r.isError && textOf(r).includes("browser page"), textOf(r));
+  const aCur = Number(textOf(await call(a, "status")).match(/current tab: (\d+)/)?.[1]);
+  await popupEval(`chrome.tabs.update(${aCur}, { url: 'chrome://version' }).then(() => 1)`);
+  await sleep(1500);
+  r = await call(a, "navigate", { url: PAGE_URL + "?escaped" });
+  check("navigate drives a tab off a chrome:// page the user left it on", textOf(r).startsWith("Loaded") && textOf(r).includes("?escaped"), textOf(r));
+  r = await call(a, "navigate", { url: "data:text/html,hi" });
+  check("data: URLs get a clear refusal", r.isError && textOf(r).includes("data:"), textOf(r));
+  await call(a, "evaluate", { expression: "setTimeout(() => { window.__ans = confirm('while paused?') }, 1500), 1" });
+  await popupEval(`document.getElementById('pause').click()`);
+  await sleep(3000);
+  await popupEval(`document.getElementById('pause').click()`);
+  r = await until(async () => {
+    const x = await call(a, "evaluate", { expression: "String(window.__ans)" });
+    return textOf(x) === "true" ? x : undefined;
+  }, 20_000);
+  check("a dialog that opened while paused gets answered on resume", r && textOf(r) === "true", r ? textOf(r) : "never answered");
+  // switch session A onto B's old tab, so after the restart it must come back to *that* one (not its own group's tab)
+  const bOld = Number(textOf(await call(a, "tabs_list")).split("\n").find((l) => /\/\?b(\s|$)/.test(l))?.match(/(\d+)/)?.[1]);
+  r = await call(a, "tab_select", { tabId: bOld });
+  check("session A switches to another tab", textOf(r).startsWith("Now driving"), textOf(r));
+
   // 9. daemon restarts mid-flight: shims and the extension both find their way back
   execFileSync(process.execPath, [cli, "restart"], { env, stdio: "ignore" });
   let back = "";
@@ -388,7 +414,7 @@ try {
   }
   check("after a daemon restart, the shim reconnects and the extension re-pairs", back.includes("✓ Browser connected"), back);
   r = await call(a, "evaluate", { expression: "location.href" });
-  check("the session finds its own tab again (via its tab group)", textOf(r).startsWith(PAGE_URL), textOf(r));
+  check("the session comes back to the exact tab it was driving", textOf(r).startsWith(PAGE_URL) && textOf(r).includes("?b"), textOf(r));
   r = await call(a, "tab_open", { url: PAGE_URL + "?after-restart" });
   check("and it can still fly", textOf(r).includes("Flight Deck Test"), textOf(r));
 

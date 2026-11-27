@@ -47,12 +47,25 @@ function lanAddresses(): string[] {
 }
 
 async function stop(): Promise<boolean> {
-  if (!existsSync(paths.pid())) return false;
-  const pid = Number(readFileSync(paths.pid(), "utf8"));
+  const health = await daemonHealth(loadConfig());
+  const filePid = existsSync(paths.pid()) ? Number(readFileSync(paths.pid(), "utf8")) : NaN;
+  // Only ever signal a process we know is our daemon: the one /health vouches for, or (if it's hung) a pid
+  // whose command line is clearly tabpilot. A stale pid file can point at some unrelated process by now.
+  let pid: number | null = health?.pid ?? null;
+  if (pid === null && Number.isInteger(filePid)) {
+    try {
+      const cmd = readFileSync(`/proc/${filePid}/cmdline`, "utf8");
+      if (/tabpilot|cli\.js/.test(cmd) && /daemon/.test(cmd)) pid = filePid;
+    } catch {}
+  }
+  if (pid === null) {
+    if (existsSync(paths.pid())) unlinkSync(paths.pid());
+    return false;
+  }
   try {
     process.kill(pid, "SIGTERM");
   } catch {
-    unlinkSync(paths.pid());
+    if (existsSync(paths.pid())) unlinkSync(paths.pid());
     return false;
   }
   for (let i = 0; i < 100 && (await daemonHealth(loadConfig())); i++) await new Promise((r) => setTimeout(r, 100));

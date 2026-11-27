@@ -61,6 +61,15 @@ closes `tabId`, or the current tab.
 
 waits for *that* navigation's `load` event, tracked by CDP's loader ID, so a slow earlier navigation can't fool it. same-page moves (hash links, SPA route changes, back/forward inside an SPA) come back right away as "Moved (same page, no reload)". if a load times out, it tells you where the page got to instead of failing.
 
+a few things it handles so Claude doesn't get confused:
+
+- **bare hosts**: `localhost:3000`, `myapp.test:8080` and `example.com` all get `http://` added
+- **back/forward from the cache**: pages Chrome restores from its back/forward cache count as loaded right away
+- **error pages**: a 4xx/5xx with an empty body loads fine, with a heads-up that Chrome is showing its own error page. a site that can't be reached, or gets blocked by an ad blocker, comes back as an error right away instead of waiting out the timeout
+- **browser pages**: `chrome://`, `about:` and friends are off-limits to every extension, so they're refused up front. if *you* left the tab on one, `navigate` still drives it off to a normal page
+- **`data:` URLs**: Chrome won't open those in a tab from the debugger. open a real page and build content with `evaluate`
+- **the tab goes away**: if the tab gets closed or you take it back mid-load, the call fails right away and says why
+
 ## eyes
 
 ### `snapshot`
@@ -239,8 +248,9 @@ the escape hatch. some fun ones:
 
 ## automatic stuff you don't have to think about
 
-- **dialogs**: `alert`, `confirm`, `prompt` and `beforeunload` would freeze the page. tabpilot accepts them right away and logs them to the console
+- **dialogs**: `alert`, `confirm`, `prompt` and `beforeunload` would freeze the page. tabpilot accepts them right away and logs them to the console. only on tabs a session is actually driving: tabs it let go of are yours again. if one pops up while you've paused it, it gets answered when you resume
 - **startup logs**: `tab_open` attaches before navigating, so nothing gets missed
-- **cleanup**: when a session ends, its debugger attachments get released. tabs untouched for 15 minutes get let go too, and the next tool call picks them back up (recording pauses in between)
+- **one tab at a time**: when a session switches to another tab, it lets go of the old one (unless another session is still on it)
+- **cleanup**: when a session ends, its debugger attachments get released. sessions that vanish without saying bye (killed client) expire after an hour of silence. tabs untouched for 15 minutes get let go too, and the next tool call picks them back up (recording pauses in between)
 - **pause**: if you hit Pause in the popup, every tool fails fast with a message telling the AI to wait for you
-- **finding its way back**: each session's tabs live in a tab group named after it. if the daemon restarts or the browser reconnects, the session finds its tab again through that group
+- **finding its way back**: each session's tabs live in a tab group named after it. if the daemon restarts or the browser reconnects, the session comes back to the exact tab it was driving (remembered in `~/.tabpilot/sessions.json`), or falls back to its tab group

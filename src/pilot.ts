@@ -1,5 +1,7 @@
 import type { Bridge } from "./bridge.js";
-import { hostAllowed, type Config } from "./config.js";
+import { readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { homeDir, hostAllowed, type Config } from "./config.js";
 import { log } from "./log.js";
 
 /**
@@ -25,6 +27,11 @@ export class Session {
 
   get label(): string {
     return this.key.replace(/-/g, "").slice(0, 4);
+  }
+
+  /** Page attribute this session's snapshot refs live in, so two sessions on one tab can't clobber each other's refs. */
+  get refAttr(): string {
+    return `data-tp-${this.label.toLowerCase().replace(/[^a-z0-9]/g, "") || "x"}`;
   }
 
   get groupTitle(): string {
@@ -79,10 +86,10 @@ const MODIFIERS: Record<string, number> = { alt: 1, control: 2, ctrl: 2, meta: 4
 
 // ---- scripts that run inside the page (stringified, so no closures) ----
 
-const SNAPSHOT_FN = function (opts: { maxElements: number; maxText: number; includeText: boolean }) {
+const SNAPSHOT_FN = function (opts: { maxElements: number; maxText: number; includeText: boolean; attr: string }) {
   const SEL =
     'a[href],button,input,select,textarea,summary,[role=button],[role=link],[role=checkbox],[role=radio],[role=tab],[role=menuitem],[role=option],[role=switch],[role=combobox],[role=textbox],[role=slider],[contenteditable=""],[contenteditable=true],[onclick],[tabindex]:not([tabindex="-1"])';
-  document.querySelectorAll("[data-tp-ref]").forEach((e) => e.removeAttribute("data-tp-ref"));
+  document.querySelectorAll(`[${opts.attr}]`).forEach((e) => e.removeAttribute(opts.attr));
   const out: string[] = [];
   let n = 0;
   let hidden = 0;
@@ -95,7 +102,7 @@ const SNAPSHOT_FN = function (opts: { maxElements: number; maxText: number; incl
       continue;
     }
     const ref = "e" + ++n;
-    el.setAttribute("data-tp-ref", ref);
+    el.setAttribute(opts.attr, ref);
     const tag = el.tagName.toLowerCase();
     const input = el as HTMLInputElement;
     const role = el.getAttribute("role") || (tag === "a" ? "link" : tag === "input" ? input.type || "text" : tag);
@@ -144,9 +151,9 @@ const SNAPSHOT_FN = function (opts: { maxElements: number; maxText: number; incl
   };
 };
 
-const LOCATE_FN = function (t: { ref?: string; selector?: string; text?: string }) {
+const LOCATE_FN = function (t: { ref?: string; selector?: string; text?: string; attr: string }) {
   let el: HTMLElement | null = null;
-  if (t.ref) el = document.querySelector(`[data-tp-ref="${t.ref}"]`);
+  if (t.ref) el = document.querySelector(`[${t.attr}="${t.ref}"]`);
   else if (t.selector) el = document.querySelector(t.selector);
   else if (t.text) {
     const want = t.text.trim().toLowerCase();
@@ -201,6 +208,10 @@ export class Pilot {
   /** Tabs the user took back. The extension enforces this too; we keep a copy for clear error messages. */
   private released = new Set<number>();
   readonly sessions = new Map<string, Session>();
+  /** Dialogs we couldn't answer yet (the user had paused us). Answered on resume. */
+  private pendingDialogs = new Map<number, any>();
+  /** client key -> the tab it was driving, so a daemon restart picks up the right tab (not just any tab in its group). */
+  private savedTabs: Record<string, { tabId: number; instance: string | null }> = {};
 
   constructor(
     readonly bridge: Bridge,
@@ -232,16 +243,69 @@ export class Pilot {
       for (const s of this.sessions.values()) s.forgetTab();
     });
     // alert()/confirm()/prompt() freeze the page until someone answers. We answer, and write it down.
+    // Only for tabs a session is actually driving: tabs we've let go of are the user's business.
     bridge.on("cdp", (tabId: number, method: string, p: any) => {
       if (method !== "Page.javascriptDialogOpening") return;
-      this.bridge
-        .call("cdp", { tabId, method: "Page.handleJavaScriptDialog", params: { accept: true, promptText: p.defaultPrompt ?? "" } })
-        .catch(() => {});
-      this.bridge.recorder(tabId).pushConsole({ ts: Date.now(), level: "dialog", text: `${p.type}(${JSON.stringify(p.message)}) → auto-accepted` });
+      if (!this.attachments.has(tabId)) return;
+      this.pendingDialogs.set(tabId, p);
+      this.answerDialog(tabId);
     });
+    bridge.on("paused", (paused: boolean) => {
+      if (!paused) for (const tabId of this.pendingDialogs.keys()) this.answerDialog(tabId);
+    });
+    try {
+      this.savedTabs = JSON.parse(readFileSync(join(homeDir(), "sessions.json"), "utf8"));
+    } catch {
+      this.savedTabs = {};
+    }
     // Sessions that vanish without saying goodbye (killed client, crashed shim) would leave Chrome's
     // "being debugged" bar up forever. Let go of tabs nobody has touched in a while.
     setInterval(() => this.detachIdle(), 60_000).unref();
+  }
+
+  private answerDialog(tabId: number) {
+    const p = this.pendingDialogs.get(tabId);
+    if (!p) return;
+    this.bridge
+      .call("cdp", { tabId, method: "Page.handleJavaScriptDialog", params: { accept: true, promptText: p.defaultPrompt ?? "" } })
+      .then(() => {
+        this.pendingDialogs.delete(tabId);
+        this.bridge.recorder(tabId).pushConsole({ ts: Date.now(), level: "dialog", text: `${p.type}(${JSON.stringify(p.message)}) → auto-accepted` });
+      })
+      .catch((e) => {
+        // Paused: we'll answer on resume. Anything else (dialog already gone, tab closed): forget it.
+        if (!this.bridge.paused) this.pendingDialogs.delete(tabId);
+        void e;
+      });
+  }
+
+  /** Make tabId this session's current tab, and let go of the one it was driving before. */
+  async setTab(s: Session, tabId: number) {
+    const old = s.tabId;
+    s.tabId = tabId;
+    this.savedTabs[s.key] = { tabId, instance: this.bridge.instanceId };
+    this.saveTabs();
+    if (old !== null && old !== tabId) await this.release(s, old);
+  }
+
+  private async release(s: Session, tabId: number) {
+    const users = this.attachments.get(tabId);
+    if (!users) return;
+    users.delete(s.id);
+    if (users.size === 0) {
+      this.attachments.delete(tabId);
+      this.lastUsed.delete(tabId);
+      this.pendingDialogs.delete(tabId);
+      await this.bridge.call("debugger.detach", { tabId }).catch(() => {});
+    }
+  }
+
+  private saveTabs() {
+    try {
+      writeFileSync(join(homeDir(), "sessions.json"), JSON.stringify(this.savedTabs));
+    } catch {
+      /* not worth failing a tool call over */
+    }
   }
 
   private async detachIdle() {
@@ -269,6 +333,17 @@ export class Pilot {
         this.lastUsed.delete(tabId);
         await this.bridge.call("debugger.detach", { tabId }).catch(() => {});
       }
+    }
+  }
+
+  /** Pages Chrome won't let any extension debug, or won't open from the debugger. Say so up front. */
+  checkNavigable(url: string) {
+    const scheme = url.slice(0, url.indexOf(":") + 1).toLowerCase();
+    if (/^(chrome|chrome-extension|chrome-untrusted|devtools|edge|brave|opera|vivaldi|view-source):$/.test(scheme) || (scheme === "about:" && !/^about:blank$/i.test(url))) {
+      throw new Error(`${url} is a browser page, and Chrome doesn't let extensions drive those. Use a regular web page.`);
+    }
+    if (scheme === "data:" || scheme === "javascript:") {
+      throw new Error(`Chrome blocks opening ${scheme} URLs in a tab. Open a real page (even about:blank) and build content with evaluate instead.`);
     }
   }
 
@@ -312,6 +387,16 @@ export class Pilot {
   async tab(s: Session): Promise<number> {
     if (s.tabId === null && !s.recovered && this.bridge.connected) {
       s.recovered = true;
+      const saved = this.savedTabs[s.key];
+      if (saved && saved.instance && saved.instance === this.bridge.instanceId) {
+        const t = await this.bridge.call<any>("tabs.get", { tabId: saved.tabId }).catch(() => null);
+        if (t) {
+          s.tabId = saved.tabId;
+          s.groupId = t.groupId ?? null;
+          log(`session ${s.label} picked up where it left off on tab ${saved.tabId}`);
+          return s.tabId;
+        }
+      }
       const found = await this.bridge.call<{ groupId: number; tabId: number } | null>("groups.find", { title: s.groupTitle }).catch(() => null);
       if (found) {
         s.groupId = found.groupId;
@@ -354,12 +439,12 @@ export class Pilot {
   }
 
   snapshot(s: Session, opts: { maxElements: number; maxText: number; includeText: boolean }) {
-    return this.call<any>(s, SNAPSHOT_FN, opts);
+    return this.call<any>(s, SNAPSHOT_FN, { ...opts, attr: s.refAttr });
   }
 
   async locate(s: Session, t: Target) {
     if (!t.ref && !t.selector && !t.text) throw new Error("Tell me what to target: ref (from snapshot), selector, or text.");
-    const r = await this.call<any>(s, LOCATE_FN, t);
+    const r = await this.call<any>(s, LOCATE_FN, { ...t, attr: s.refAttr });
     if (r.error) throw new Error(r.error);
     return r as { x: number; y: number; width: number; height: number; pageX: number; pageY: number; tag: string; covered?: string };
   }
@@ -370,7 +455,7 @@ export class Pilot {
    * right away instead of waiting for a load event that never comes.
    * `trigger` may return Page.navigate's result ({loaderId, errorText}).
    */
-  async navigate(s: Session, trigger: () => Promise<any>, timeoutMs: number): Promise<"loaded" | "same-document" | "timeout"> {
+  async navigate(s: Session, trigger: () => Promise<any>, timeoutMs: number, opts: { crossDocument?: boolean } = {}): Promise<"loaded" | "same-document" | "timeout" | "http-error"> {
     const tabId = await this.tab(s);
     const tree = await this.cdp(s, "Page.getFrameTree");
     const mainId: string = tree.frameTree.frame.id;
@@ -384,9 +469,13 @@ export class Pilot {
     const wait = this.bridge.waitFor<"loaded" | "same-document">(
       tabId,
       (m, p) => {
+        // Back/forward from the bfcache restores the old page without a fresh load event.
+        if (m === "Page.frameNavigated" && p?.frame?.id === mainId && p.type === "BackForwardCacheRestore") return "loaded";
+        // The site (or a redirect it did) couldn't load and Chrome swapped in its error page. That's the end of the road.
+        if (m === "Page.frameNavigated" && p?.frame?.id === mainId && String(p.frame.url ?? "").startsWith("chrome-error://")) return "loaded";
         if (p?.frameId !== mainId) return undefined;
         if (m === "Page.lifecycleEvent" && p.name === "load" && p.loaderId !== oldLoader && (!expected || p.loaderId === expected)) return "loaded";
-        if (m === "Page.navigatedWithinDocument") {
+        if (m === "Page.navigatedWithinDocument" && !opts.crossDocument) {
           if (!triggered) sawSameDoc = true;
           else if (!expected) return "same-document";
         }
@@ -397,6 +486,19 @@ export class Pilot {
     try {
       const r = await trigger();
       triggered = true;
+      if (r?.errorText === "net::ERR_HTTP_RESPONSE_CODE_FAILURE") {
+        // The server answered 4xx/5xx with an empty body. That's a page, not a crash: Chrome shows its error page.
+        expected = r.loaderId;
+        const t = new Promise<"timeout">((res) => setTimeout(() => res("timeout"), Math.min(timeoutMs, 5000)));
+        await Promise.race([wait.promise, t]).catch(() => {});
+        wait.cancel();
+        return "http-error";
+      }
+      if (r?.errorText === "net::ERR_ABORTED") {
+        const still = await this.bridge.call("tabs.get", { tabId }).catch(() => null);
+        throw new Error(still ? "Navigation was canceled (another navigation, or the page itself, stopped it)." : "The tab was closed while it was loading.");
+      }
+      if (r?.errorText === "net::ERR_BLOCKED_BY_CLIENT") throw new Error("The browser blocked that page (an ad blocker or another extension, most likely).");
       if (r?.errorText) throw new Error(`Navigation failed: ${r.errorText}`);
       if (r && "frameId" in r) {
         // Page.navigate tells us directly: a loaderId means a new document is coming.
@@ -405,7 +507,7 @@ export class Pilot {
           return "same-document";
         }
         expected = r.loaderId;
-      } else if (sawSameDoc) {
+      } else if (sawSameDoc && !opts.crossDocument) {
         wait.cancel();
         return "same-document";
       }
@@ -414,6 +516,22 @@ export class Pilot {
       wait.cancel();
       throw e;
     }
+  }
+
+  /** Navigate without CDP (for tabs sitting on a page we can't debug), then take the controls again. */
+  async navigatePlain(s: Session, url: string, timeoutMs: number): Promise<"loaded" | "timeout"> {
+    const tabId = await this.tab(s);
+    const before = await this.bridge.call<any>("tabs.get", { tabId });
+    await this.bridge.call("tabs.navigate", { tabId, url });
+    const deadline = Date.now() + timeoutMs;
+    let t: any;
+    do {
+      await new Promise((r) => setTimeout(r, 250));
+      t = await this.bridge.call<any>("tabs.get", { tabId });
+      // Don't take the old page's "complete" for the new one.
+    } while ((t.status !== "complete" || t.url === before.url) && Date.now() < deadline);
+    await this.attach(s, tabId);
+    return t.status === "complete" ? "loaded" : "timeout";
   }
 
   async mouse(s: Session, x: number, y: number, opts: { button?: string; clickCount?: number; modifiers?: number; hoverOnly?: boolean } = {}) {
@@ -429,21 +547,32 @@ export class Pilot {
 
   /** Press a key or combo like "Enter", "Control+a", "Shift+Tab", "Meta+k", ".", "Shift+a". */
   async press(s: Session, combo: string) {
-    const parts = combo.split("+").map((p) => p.trim()).filter(Boolean);
-    let keyName = parts.pop() ?? "";
-    if (keyName === "" && combo.endsWith("+")) keyName = "+";
-    if (combo === " ") keyName = " ";
+    let parts: string[];
+    let keyName: string;
+    if (combo === " " || combo === "+") {
+      parts = [];
+      keyName = combo;
+    } else if (combo.endsWith("++")) {
+      parts = combo.slice(0, -2).split("+").map((p) => p.trim()).filter(Boolean);
+      keyName = "+";
+    } else {
+      parts = combo.split("+").map((p) => p.trim()).filter(Boolean);
+      keyName = parts.pop() ?? "";
+    }
     let modifiers = 0;
     for (const m of parts) {
       const bit = MODIFIERS[m.toLowerCase()];
       if (bit === undefined) throw new Error(`Unknown modifier "${m}". Use Control, Shift, Alt or Meta.`);
       modifiers |= bit;
     }
-    const known = KEYS[keyName] ?? KEYS[keyName.charAt(0).toUpperCase() + keyName.slice(1)];
+    const knownName = KEYS[keyName] ? keyName : Object.keys(KEYS).find((k) => k.toLowerCase() === keyName.toLowerCase());
+    if (knownName) keyName = knownName;
+    const known = knownName ? KEYS[knownName] : undefined;
     let key: string, code: string, keyCode: number, text: string | undefined;
     if (known) {
       key = keyName === "Space" ? " " : keyName;
       ({ code, keyCode, text } = known);
+      if (modifiers & (1 | 2 | 4)) text = undefined; // Control+Enter is a shortcut, not a newline
     } else if (keyName.length === 1) {
       key = keyName;
       if (/[a-z]/i.test(keyName)) {
@@ -454,6 +583,7 @@ export class Pilot {
       } else if (/[0-9]/.test(keyName)) {
         code = `Digit${keyName}`;
         keyCode = keyName.charCodeAt(0);
+        if (modifiers & 8) key = ")!@#$%^&*("[Number(keyName)]; // US layout: Shift+1 types "!"
       } else if (PUNCTUATION[keyName]) {
         [code, keyCode] = PUNCTUATION[keyName];
       } else {

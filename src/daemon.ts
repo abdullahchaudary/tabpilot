@@ -61,7 +61,14 @@ export async function runDaemon(opts: DaemonOptions = {}) {
 
   const bridge = new Bridge(cfg);
   const pilot = new Pilot(bridge, cfg);
-  const mcpSessions = new Map<string, { transport: StreamableHTTPServerTransport; session: Session }>();
+  const mcpSessions = new Map<string, { transport: StreamableHTTPServerTransport; session: Session; lastSeen: number }>();
+  // A client killed without saying goodbye leaves its session behind. Expire quiet ones; a live shim
+  // that comes back later gets "session not found" and transparently starts a new one (same tab group).
+  const SESSION_IDLE_MS = 60 * 60_000;
+  setInterval(() => {
+    const cutoff = Date.now() - SESSION_IDLE_MS;
+    for (const m of mcpSessions.values()) if (m.lastSeen < cutoff) m.transport.close().catch(() => {});
+  }, 5 * 60_000).unref();
   const okHosts = new Set([`127.0.0.1:${cfg.port}`, `localhost:${cfg.port}`, `[::1]:${cfg.port}`]);
 
   async function handleMcp(req: IncomingMessage, res: ServerResponse) {
@@ -74,7 +81,10 @@ export async function runDaemon(opts: DaemonOptions = {}) {
 
     const sid = req.headers["mcp-session-id"];
     const existing = typeof sid === "string" ? mcpSessions.get(sid) : undefined;
-    if (existing) return existing.transport.handleRequest(req, res);
+    if (existing) {
+      existing.lastSeen = Date.now();
+      return existing.transport.handleRequest(req, res);
+    }
     if (sid) return json(res, 404, { jsonrpc: "2.0", error: { code: -32001, message: "Session not found" }, id: null });
     if (req.method !== "POST") return json(res, 400, { error: "start a session with an initialize POST" });
 
@@ -98,7 +108,7 @@ export async function runDaemon(opts: DaemonOptions = {}) {
       onsessioninitialized: (id) => {
         session.id = id;
         pilot.sessions.set(id, session);
-        mcpSessions.set(id, { transport, session });
+        mcpSessions.set(id, { transport, session, lastSeen: Date.now() });
         log(`session ${session.label} took off (${mcpSessions.size} flying)`);
       },
     });
@@ -116,7 +126,7 @@ export async function runDaemon(opts: DaemonOptions = {}) {
   const handler = (req: IncomingMessage, res: ServerResponse) => {
     const path = (req.url ?? "/").split("?")[0];
     if (path === "/health") {
-      return json(res, 200, { name: "tabpilot", version: VERSION, browser: bridge.connected, sessions: mcpSessions.size });
+      return json(res, 200, { name: "tabpilot", version: VERSION, browser: bridge.connected, sessions: mcpSessions.size, pid: process.pid });
     }
     if (path === "/mcp") {
       handleMcp(req, res).catch((e) => {
@@ -146,9 +156,10 @@ export async function runDaemon(opts: DaemonOptions = {}) {
   const hosts = !cfg.lanHost ? ["127.0.0.1"] : ["0.0.0.0", "::"].includes(cfg.lanHost) ? [cfg.lanHost] : ["127.0.0.1", cfg.lanHost];
   const servers: Server[] = [];
   for (const host of hosts) {
+    const isLan = host !== "127.0.0.1";
     const srv = createServer(handler);
     srv.on("upgrade", onUpgrade);
-    await new Promise<void>((resolve, reject) => {
+    const outcome = await new Promise<void>((resolve, reject) => {
       srv.once("error", reject);
       srv.listen(cfg.port, host, () => resolve());
     }).catch(async (e: any) => {
@@ -161,8 +172,14 @@ export async function runDaemon(opts: DaemonOptions = {}) {
         log(`port ${cfg.port} is taken by something else. Set "port" in ${paths.config()} or TABPILOT_PORT.`);
         process.exit(1);
       }
+      // The LAN address isn't there (Tailscale not up yet, DHCP gave us a new IP...). Local use still works.
+      if (isLan && hosts.includes("127.0.0.1")) {
+        log(`couldn't listen on ${host}:${cfg.port} (${e.code ?? e.message}). LAN mode is off for now; local connections still work. Fix the address with \`tabpilot lan <ip>\` and restart.`);
+        return "skip";
+      }
       throw e;
     });
+    if (outcome === "skip") continue;
     servers.push(srv);
   }
 

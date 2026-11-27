@@ -71,6 +71,14 @@ some other extension (screenshot tools, other automation stuff) is attached with
 
 you hit Cancel on Chrome's debugging bar, or **release** in the popup. that's the "hands off" signal, so tabpilot won't reattach on its own. tell Claude it's okay and it'll call `tab_select` with `force: true`.
 
+## "is a browser page" / the tab is on chrome://settings
+
+Claude can't drive `chrome://`, `about:` or Web Store pages. nobody can, that's Chrome's rule. if you left the tab on one, just ask Claude to navigate somewhere normal and it'll drive the tab off it.
+
+## "Chrome couldn't load the page and is showing its error page"
+
+the site's down, the address is wrong, or something blocked it. an ad blocker kills a lot of tracking and plain-HTTP stuff, so if it's your own dev site, allow it in there. `network` shows exactly which request broke.
+
 ## screenshots hang or come back blank
 
 background tabs don't paint. tabpilot brings hidden tabs to the front before a screenshot, but if the whole **window is minimized**, Chrome won't paint it either. un-minimize it. (on headless Linux boxes, use `--headless=new` or a virtual display.)

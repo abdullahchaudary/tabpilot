@@ -11,7 +11,7 @@ import { loadConfig, paths, type Config } from "./config.js";
 import { log } from "./log.js";
 import { VERSION } from "./version.js";
 
-export async function daemonHealth(cfg: Config): Promise<{ name: string; version: string; browser: boolean; sessions: number } | null> {
+export async function daemonHealth(cfg: Config): Promise<{ name: string; version: string; browser: boolean; sessions: number; pid?: number } | null> {
   try {
     const r = await fetch(`http://127.0.0.1:${cfg.port}/health`, { signal: AbortSignal.timeout(1500) });
     const body = await r.json();

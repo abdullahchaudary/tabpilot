@@ -86,14 +86,15 @@ function shortLocation(url?: string, line?: number): string | undefined {
 export class Bridge extends EventEmitter {
   private channel: Channel | null = null;
   private socket: WebSocket | null = null;
-  private nextId = 1;
+  // Random start: a reply meant for a previous daemon process can't match one of our ids by accident.
+  private nextId = 1 + Math.floor(Math.random() * 1e9);
   private pending = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void; timer: NodeJS.Timeout }>();
   readonly recorders = new Map<number, TabRecorder>();
   browserInfo: { userAgent?: string; extensionVersion?: string; connectedAt?: number; remote?: string } = {};
   /** The user hit Pause in the extension. The extension enforces it; we just fail fast and say why. */
   paused = false;
   /** Random id the extension keeps per browser run. A new one means every tab id we know is stale. */
-  private instanceId: string | null = null;
+  instanceId: string | null = null;
 
   constructor(private cfg: Config) {
     super();
@@ -130,7 +131,9 @@ export class Bridge extends EventEmitter {
 
     const handshakeTimer = setTimeout(() => stage !== "open" && fail(4000, "handshake timeout"), 10_000);
 
-    ws.on("message", (data) => {
+    ws.on("message", (data: any) => {
+      // Nobody gets to push big frames before proving they know the pairing code.
+      if (stage !== "open" && (data?.length ?? 0) > 16_384) return fail(4004, "frame too big before handshake");
       onFrame(data.toString()).catch((e) => fail(4000, `handshake error: ${e?.message ?? e}`));
     });
 
@@ -359,7 +362,7 @@ export class Bridge extends EventEmitter {
    */
   waitFor<T>(tabId: number, match: (method: string, params: any) => T | undefined, timeoutMs: number) {
     let cancel: () => void = () => {};
-    const promise = new Promise<T | "timeout">((resolve) => {
+    const promise = new Promise<T | "timeout">((resolve, reject) => {
       const onEvent = (t: number, m: string, p: any) => {
         if (t !== tabId) return;
         const v = match(m, p);
@@ -372,14 +375,33 @@ export class Bridge extends EventEmitter {
         cancel();
         resolve("timeout");
       };
+      // The tab closing or the debugger letting go means the event is never coming. Say why, right away.
+      const onTabGone = (t: number, reason?: string) => {
+        if (t !== tabId) return;
+        cancel();
+        reject(
+          new Error(
+            reason === undefined
+              ? "The tab was closed while I was waiting on it."
+              : reason === "canceled_by_user" || reason === "released_by_user"
+                ? `The user took back tab ${tabId} while I was waiting on it.`
+                : "Chrome let go of the tab while I was waiting (it may have gone to a page extensions can't drive, like chrome://).",
+          ),
+        );
+      };
+      const onClosed = (t: number) => onTabGone(t);
       const timer = setTimeout(onGone, timeoutMs);
       cancel = () => {
         clearTimeout(timer);
         this.off("cdp", onEvent);
         this.off("disconnected", onGone);
+        this.off("detached", onTabGone);
+        this.off("tabRemoved", onClosed);
       };
       this.on("cdp", onEvent);
       this.on("disconnected", onGone);
+      this.on("detached", onTabGone);
+      this.on("tabRemoved", onClosed);
     });
     return { promise, cancel: () => cancel() };
   }

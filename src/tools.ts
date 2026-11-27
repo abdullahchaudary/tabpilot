@@ -24,6 +24,16 @@ Use evaluate for anything custom, and cdp for raw Chrome DevTools Protocol acces
 
 const text = (s: string): CallToolResult => ({ content: [{ type: "text", text: s }] });
 
+/** "localhost:3000" and "myapp.test:8080" aren't schemes. Only leave real URLs alone; give bare hosts http://. */
+function normalizeUrl(url: string): string {
+  const u = url.trim();
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(u)) return u;
+  if (/^(about|data|javascript|mailto|blob|chrome|chrome-extension|chrome-untrusted|edge|brave|devtools|view-source|file):/i.test(u)) return u;
+  return `http://${u}`;
+}
+
+const HTTP_ERROR_NOTE = "the server answered with an HTTP error (4xx/5xx) and an empty page, so Chrome is showing its own error page. `network` has the status code.";
+
 const targetShape = {
   ref: z.string().optional().describe("Element ref from the latest snapshot, e.g. e12. Most reliable."),
   selector: z.string().optional().describe("CSS selector, if you know the markup."),
@@ -83,7 +93,9 @@ export function createMcpServer(pilot: Pilot, s: Session): McpServer {
         bridge.paused ? "  ⏸ PAUSED by the user. Wait for them to resume." : "  controls: active",
         `  allow-list: ${pilot.cfg.allow.length ? pilot.cfg.allow.join(", ") : "off (any site)"}`,
       ];
-      if (s.tabId !== null) {
+      if (s.tabId !== null && bridge.paused) {
+        lines.push(`  current tab: ${s.tabId} (details hidden while paused)`);
+      } else if (s.tabId !== null) {
         const t = await bridge.call<any>("tabs.get", { tabId: s.tabId }).catch(() => null);
         lines.push(t ? `  current tab: ${t.id} ${t.title} (${t.url})` : "  current tab: gone");
       } else lines.push("  current tab: none yet (tab_open or tab_select)");
@@ -114,7 +126,8 @@ export function createMcpServer(pilot: Pilot, s: Session): McpServer {
       background: z.boolean().optional().describe("Open without stealing focus. Default false."),
     },
     async ({ url, background }) => {
-      const target = /^[a-z][a-z0-9+.-]*:/i.test(url) ? url : `http://${url}`;
+      const target = normalizeUrl(url);
+      pilot.checkNavigable(target);
       pilot.checkAllowed(target);
       const created = await bridge.call<{ tabId: number; groupId: number | null }>("tabs.create", {
         active: !background,
@@ -123,16 +136,23 @@ export function createMcpServer(pilot: Pilot, s: Session): McpServer {
         groupColor: s.color,
       });
       s.groupId = created.groupId;
-      s.tabId = created.tabId;
       await pilot.attach(s, created.tabId);
+      await pilot.setTab(s, created.tabId);
       let result: string;
       try {
         result = await pilot.navigate(s, () => pilot.cdp(s, "Page.navigate", { url: target }), 20_000);
       } catch (e: any) {
         return text(`Opened tab ${created.tabId}, but ${e.message}`);
       }
-      const title = await pilot.evaluate<string>(s, "document.title").catch(() => "");
-      return text(`Opened tab ${created.tabId}: ${title || target}${result === "timeout" ? " (still loading after 20s)" : ""}\nNext: snapshot to see what's on the page.`);
+      const where = await pilot.evaluate<{ url: string; title: string }>(s, "({url: location.href, title: document.title})").catch(() => null);
+      if (where?.url.startsWith("chrome-error://") && result !== "http-error") {
+        return text(`Opened tab ${created.tabId}, but Chrome couldn't load ${target} and is showing its error page. \`network\` shows which request broke.`);
+      }
+      if (where?.url === "about:blank" && target !== "about:blank") {
+        return text(`Opened tab ${created.tabId}, but Chrome didn't load ${target} (it's still on about:blank). Check console for the reason.`);
+      }
+      const note = result === "timeout" ? " (still loading after 20s)" : result === "http-error" ? `\nHeads up: ${HTTP_ERROR_NOTE}` : "";
+      return text(`Opened tab ${created.tabId}: ${where?.title || target}${note}\nNext: snapshot to see what's on the page.`);
     },
   );
 
@@ -148,7 +168,7 @@ export function createMcpServer(pilot: Pilot, s: Session): McpServer {
       const t = await bridge.call<any>("tabs.get", { tabId });
       pilot.checkAllowed(t.url);
       await pilot.attach(s, tabId, force);
-      s.tabId = tabId; // note: we don't adopt the user's tab group; our own tabs stay in ours
+      await pilot.setTab(s, tabId); // note: we don't adopt the user's tab group; our own tabs stay in ours
       if (focus) await bridge.call("tabs.activate", { tabId });
       return text(`Now driving tab ${tabId}: ${t.title} (${t.url}).\nHeads up: console/network history starts now. Use navigate with action "reload" to capture startup logs.`);
     },
@@ -180,9 +200,17 @@ export function createMcpServer(pilot: Pilot, s: Session): McpServer {
     async ({ url, action, timeoutMs = 20_000 }) => {
       let trigger: () => Promise<unknown>;
       if (url) {
-        const target = /^[a-z][a-z0-9+.-]*:/i.test(url) ? url : `http://${url}`;
+        const target = normalizeUrl(url);
+        pilot.checkNavigable(target);
         pilot.checkAllowed(target);
         trigger = () => pilot.cdp(s, "Page.navigate", { url: target });
+        // Tab is parked on a page we can't debug (the user went to chrome://settings, say)? Drive it off with a plain navigation.
+        const t = await bridge.call<any>("tabs.get", { tabId: await pilot.tab(s) });
+        if (/^(chrome|chrome-extension|chrome-untrusted|devtools|edge|brave|view-source|about):/i.test(t.url) && t.url !== "about:blank") {
+          const res = await pilot.navigatePlain(s, target, timeoutMs);
+          const w = await pilot.evaluate<{ url: string; title: string }>(s, "({url: location.href, title: document.title})").catch(() => null);
+          return text(`${res === "timeout" ? `Still loading after ${timeoutMs}ms, but here's where we are` : "Loaded"}: ${w?.title ?? ""} (${w?.url ?? target})`);
+        }
       } else if (action === "reload" || action === "hard-reload") {
         trigger = () => pilot.cdp(s, "Page.reload", { ignoreCache: action === "hard-reload" });
       } else if (action === "back" || action === "forward") {
@@ -193,10 +221,13 @@ export function createMcpServer(pilot: Pilot, s: Session): McpServer {
       } else {
         throw new Error("Give me a url or an action (back, forward, reload, hard-reload).");
       }
-      const result = await pilot.navigate(s, trigger, timeoutMs);
+      const result = await pilot.navigate(s, trigger, timeoutMs, { crossDocument: action === "reload" || action === "hard-reload" });
       const where = await pilot.evaluate<{ url: string; title: string }>(s, "({url: location.href, title: document.title})").catch(() => null);
       const how = result === "timeout" ? `Still loading after ${timeoutMs}ms, but here's where we are` : result === "same-document" ? "Moved (same page, no reload)" : "Loaded";
-      return text(`${how}: ${where?.title ?? ""} (${where?.url ?? url})`);
+      if (where?.url.startsWith("chrome-error://") && result !== "http-error") {
+        throw new Error("Chrome couldn't load the page and is showing its error page (unreachable, blocked, or a redirect that failed). `network` shows which request broke.");
+      }
+      return text(`${how}: ${where?.title ?? ""} (${where?.url ?? url})${result === "http-error" ? `\nHeads up: ${HTTP_ERROR_NOTE}` : ""}`);
     },
   );
 
@@ -371,6 +402,12 @@ export function createMcpServer(pilot: Pilot, s: Session): McpServer {
             `(() => { const el = document.activeElement; if (!el) return; if (typeof el.select === 'function') el.select(); else if (el.isContentEditable) document.execCommand('selectAll'); })()`,
           );
           if (value === "") await pilot.press(s, "Backspace");
+        } else if (hasTarget) {
+          // Appending: the click put the caret wherever it landed. Move it to the end.
+          await pilot.evaluate(
+            s,
+            `(() => { const el = document.activeElement; if (!el) return; try { if (typeof el.setSelectionRange === 'function') { const n = el.value.length; el.setSelectionRange(n, n); return; } } catch {} if (el.isContentEditable) { const r = document.createRange(); r.selectNodeContents(el); r.collapse(false); const sel = getSelection(); sel.removeAllRanges(); sel.addRange(r); } })()`,
+          );
         }
         if (value) await pilot.cdp(s, "Input.insertText", { text: value });
       };
@@ -378,7 +415,8 @@ export function createMcpServer(pilot: Pilot, s: Session): McpServer {
       // Pages that are still booting (hydration) can wipe or steal the field right after we type.
       // Check it stuck, and give it one more go if it didn't.
       let note = "";
-      if (value && hasTarget) {
+      // Only re-type when we replace the content; re-typing an append would double it.
+      if (value && hasTarget && (clear ?? true)) {
         const landed = async () => {
           const t = await pilot.evaluate<string | null>(s, fieldText).catch(() => null);
           return t === null || t.includes(value);
@@ -414,22 +452,23 @@ export function createMcpServer(pilot: Pilot, s: Session): McpServer {
     { ...targetShape, option: z.string() },
     async ({ ref, selector, text: byText, option }) => {
       await pilot.locate(s, { ref, selector, text: byText });
-      const sel = ref ? `[data-tp-ref="${ref}"]` : selector;
+      const sel = ref ? `[${s.refAttr}="${ref}"]` : selector;
       if (!sel) throw new Error("select_option needs a ref or selector.");
       const r = await pilot.evaluate<string>(
         s,
         `(() => {
           const el = document.querySelector(${JSON.stringify(sel)});
-          if (!el || el.tagName !== 'SELECT') return 'That element is not a <select>. For custom dropdowns, click it open and click the option.';
+          if (!el || el.tagName !== 'SELECT') return '!That element is not a <select>. For custom dropdowns, click it open and click the option.';
           const want = ${JSON.stringify(option)};
           const opt = [...el.options].find(o => o.value === want) || [...el.options].find(o => o.label.trim() === want) || [...el.options].find(o => o.label.toLowerCase().includes(want.toLowerCase()));
-          if (!opt) return 'No option matches. Options: ' + [...el.options].map(o => o.label.trim()).join(' | ');
+          if (!opt) return '!No option matches ' + JSON.stringify(want) + '. Options: ' + [...el.options].map(o => o.label.trim()).join(' | ');
           el.value = opt.value;
           el.dispatchEvent(new Event('input', { bubbles: true }));
           el.dispatchEvent(new Event('change', { bubbles: true }));
           return 'Selected "' + opt.label.trim() + '".';
         })()`,
       );
+      if (r.startsWith("!")) throw new Error(r.slice(1));
       return text(r);
     },
   );

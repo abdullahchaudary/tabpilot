@@ -221,8 +221,10 @@ function onMessage(msg) {
 }
 
 async function handle({ id, method, params }) {
+  // Reply on the connection the request came in on. If the daemon restarted meanwhile, the answer is stale: drop it.
+  const ch = channel;
   // Paused means hands off. Letting go of a tab is the one thing that's always allowed.
-  if (paused && method !== "debugger.detach") return channel?.send({ id, error: PAUSED_MSG });
+  if (paused && method !== "debugger.detach") return ch?.send({ id, error: PAUSED_MSG });
   try {
     const label = describe(method, params ?? {});
     if (label) {
@@ -230,9 +232,9 @@ async function handle({ id, method, params }) {
       scheduleFlightUpdate();
     }
     const result = await (handlers[method] ?? unknown(method))(params ?? {});
-    channel?.send({ id, result: result ?? null });
+    if (ch === channel) ch?.send({ id, result: result ?? null });
   } catch (e) {
-    channel?.send({ id, error: e?.message ?? String(e) });
+    if (ch === channel) ch?.send({ id, error: e?.message ?? String(e) });
   }
 }
 
@@ -242,7 +244,17 @@ const unknown = (method) => () => {
 
 // ---------------------------------------------------------------- commands from the daemon
 
-const tabInfo = (t) => ({ id: t.id, windowId: t.windowId, url: t.url ?? t.pendingUrl ?? "", title: t.title ?? "", active: t.active, groupId: t.groupId });
+const tabInfo = (t) => ({ id: t.id, windowId: t.windowId, url: t.url ?? t.pendingUrl ?? "", title: t.title ?? "", active: t.active, groupId: t.groupId, status: t.status });
+
+// Attach and detach for the same tab must not overlap, or a detach still in flight makes the next attach fail.
+const tabLocks = new Map();
+function withTabLock(tabId, fn) {
+  const run = (tabLocks.get(tabId) ?? Promise.resolve()).then(fn, fn);
+  const tail = run.catch(() => {});
+  tabLocks.set(tabId, tail);
+  tail.then(() => tabLocks.get(tabId) === tail && tabLocks.delete(tabId));
+  return run;
+}
 
 const handlers = {
   "tabs.list": async () => (await chrome.tabs.query({})).map(tabInfo),
@@ -279,12 +291,15 @@ const handlers = {
 
   "tabs.close": async ({ tabId }) => chrome.tabs.remove(tabId),
 
+  // Plain navigation without the debugger, for leaving pages Chrome won't let us debug (chrome://...).
+  "tabs.navigate": async ({ tabId, url }) => tabInfo(await chrome.tabs.update(tabId, { url })),
+
   "tabs.activate": async ({ tabId }) => {
     const t = await chrome.tabs.update(tabId, { active: true });
     await chrome.windows.update(t.windowId, { focused: true });
   },
 
-  "debugger.attach": async ({ tabId, force = false }) => {
+  "debugger.attach": ({ tabId, force = false }) => withTabLock(tabId, async () => {
     // The user's "hands off" is enforced here, in their browser, not just in the daemon.
     if (released.has(tabId) && !force) {
       throw new Error(`The user took back tab ${tabId}. Ask them before grabbing it again, then call tab_select with force: true.`);
@@ -302,13 +317,13 @@ const handlers = {
     }
     attached.add(tabId);
     persistTabs();
-  },
+  }),
 
-  "debugger.detach": async ({ tabId }) => {
+  "debugger.detach": ({ tabId }) => withTabLock(tabId, async () => {
     attached.delete(tabId);
     await chrome.debugger.detach({ tabId }).catch(() => {});
     persistTabs();
-  },
+  }),
 
   // Find a session's tab group by title and return its most recently used tab.
   "groups.find": async ({ title }) => {
