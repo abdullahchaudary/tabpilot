@@ -292,7 +292,10 @@ const handlers = {
   "tabs.close": async ({ tabId }) => chrome.tabs.remove(tabId),
 
   // Plain navigation without the debugger, for leaving pages Chrome won't let us debug (chrome://...).
-  "tabs.navigate": async ({ tabId, url }) => tabInfo(await chrome.tabs.update(tabId, { url })),
+  "tabs.navigate": async ({ tabId, url }) => {
+    if (released.has(tabId)) throw new Error(`The user took back tab ${tabId}. Ask them before grabbing it again, then call tab_select with force: true.`);
+    return tabInfo(await chrome.tabs.update(tabId, { url }));
+  },
 
   "tabs.activate": async ({ tabId }) => {
     const t = await chrome.tabs.update(tabId, { active: true });

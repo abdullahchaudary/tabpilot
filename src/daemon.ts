@@ -67,7 +67,11 @@ export async function runDaemon(opts: DaemonOptions = {}) {
   const SESSION_IDLE_MS = 60 * 60_000;
   setInterval(() => {
     const cutoff = Date.now() - SESSION_IDLE_MS;
-    for (const m of mcpSessions.values()) if (m.lastSeen < cutoff) m.transport.close().catch(() => {});
+    for (const m of mcpSessions.values()) {
+      if (m.lastSeen >= cutoff) continue;
+      m.session.expired = true;
+      m.transport.close().catch(() => {});
+    }
   }, 5 * 60_000).unref();
   const okHosts = new Set([`127.0.0.1:${cfg.port}`, `localhost:${cfg.port}`, `[::1]:${cfg.port}`]);
 
@@ -155,6 +159,7 @@ export async function runDaemon(opts: DaemonOptions = {}) {
   // Always listen on loopback. LAN mode adds a second listener (or one wildcard listener).
   const hosts = !cfg.lanHost ? ["127.0.0.1"] : ["0.0.0.0", "::"].includes(cfg.lanHost) ? [cfg.lanHost] : ["127.0.0.1", cfg.lanHost];
   const servers: Server[] = [];
+  const up: string[] = [];
   for (const host of hosts) {
     const isLan = host !== "127.0.0.1";
     const srv = createServer(handler);
@@ -181,11 +186,12 @@ export async function runDaemon(opts: DaemonOptions = {}) {
     });
     if (outcome === "skip") continue;
     servers.push(srv);
+    up.push(host);
   }
 
   writeFileSync(paths.pid(), String(process.pid));
-  log(`daemon v${VERSION} up on ${hosts.map((h) => `${h.includes(":") ? `[${h}]` : h}:${cfg.port}`).join(" + ")}`);
-  if (cfg.lanHost) log(`LAN mode: extensions can connect at ws://<this machine's IP>:${cfg.port}/ext (encrypted, pairing code required)`);
+  log(`daemon v${VERSION} up on ${up.map((h) => `${h.includes(":") ? `[${h}]` : h}:${cfg.port}`).join(" + ")}`);
+  if (cfg.lanHost && up.some((h) => h !== "127.0.0.1")) log(`LAN mode: extensions can connect at ws://<this machine's IP>:${cfg.port}/ext (encrypted, pairing code required)`);
 
   const shutdown = () => {
     log("shutting down");

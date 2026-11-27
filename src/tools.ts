@@ -209,6 +209,9 @@ export function createMcpServer(pilot: Pilot, s: Session): McpServer {
         if (/^(chrome|chrome-extension|chrome-untrusted|devtools|edge|brave|view-source|about):/i.test(t.url) && t.url !== "about:blank") {
           const res = await pilot.navigatePlain(s, target, timeoutMs);
           const w = await pilot.evaluate<{ url: string; title: string }>(s, "({url: location.href, title: document.title})").catch(() => null);
+          if (w?.url.startsWith("chrome-error://")) {
+            throw new Error("Chrome couldn't load the page and is showing its error page (unreachable, blocked, or a redirect that failed). `network` shows which request broke.");
+          }
           return text(`${res === "timeout" ? `Still loading after ${timeoutMs}ms, but here's where we are` : "Loaded"}: ${w?.title ?? ""} (${w?.url ?? target})`);
         }
       } else if (action === "reload" || action === "hard-reload") {
@@ -404,10 +407,12 @@ export function createMcpServer(pilot: Pilot, s: Session): McpServer {
           if (value === "") await pilot.press(s, "Backspace");
         } else if (hasTarget) {
           // Appending: the click put the caret wherever it landed. Move it to the end.
-          await pilot.evaluate(
+          const placed = await pilot.evaluate<boolean>(
             s,
-            `(() => { const el = document.activeElement; if (!el) return; try { if (typeof el.setSelectionRange === 'function') { const n = el.value.length; el.setSelectionRange(n, n); return; } } catch {} if (el.isContentEditable) { const r = document.createRange(); r.selectNodeContents(el); r.collapse(false); const sel = getSelection(); sel.removeAllRanges(); sel.addRange(r); } })()`,
+            `(() => { const el = document.activeElement; if (!el) return false; try { if (typeof el.setSelectionRange === 'function') { const n = el.value.length; el.setSelectionRange(n, n); return true; } } catch {} if (el.isContentEditable) { const r = document.createRange(); r.selectNodeContents(el); r.collapse(false); const sel = getSelection(); sel.removeAllRanges(); sel.addRange(r); return true; } return false; })()`,
           );
+          // email/number inputs don't allow setSelectionRange; End does the same job there.
+          if (!placed) await pilot.press(s, "End");
         }
         if (value) await pilot.cdp(s, "Input.insertText", { text: value });
       };

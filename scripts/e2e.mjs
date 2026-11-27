@@ -363,6 +363,14 @@ try {
     return x.isError ? x : undefined;
   });
   check("a released tab is off-limits until the user says so", r.isError && textOf(r).includes("took back tab"), textOf(r));
+  // the chrome:// escape hatch must respect "hands off" too
+  await popupEval(`chrome.tabs.update(${aTab}, { url: 'chrome://version' }).then(() => 1)`);
+  await sleep(1500);
+  r = await call(b, "navigate", { url: PAGE_URL + "?sneaky" });
+  const stillThere = await popupEval(`chrome.tabs.get(${aTab}).then(t => t.url)`);
+  check("a released tab can't be driven off a chrome:// page either", r.isError && textOf(r).includes("took back") && stillThere.startsWith("chrome://"), `${textOf(r)} | ${stillThere}`);
+  await popupEval(`chrome.tabs.update(${aTab}, { url: ${JSON.stringify(PAGE_URL)} }).then(() => 1)`);
+  await sleep(1500);
   r = await call(b, "tab_select", { tabId: aTab, force: true });
   check("tab_select force re-grabs it", textOf(r).startsWith("Now driving"), textOf(r));
 

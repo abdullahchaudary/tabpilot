@@ -16,6 +16,8 @@ export class Session {
   groupId: number | null = null;
   /** Did we already try to recover tabId from the browser's tab groups? */
   recovered = false;
+  /** Closed by the daemon for being idle, not by the client. The client may come back for its tab. */
+  expired = false;
   readonly color: string;
   private static colors = ["blue", "purple", "cyan", "green", "orange", "pink", "yellow", "red"];
 
@@ -211,7 +213,7 @@ export class Pilot {
   /** Dialogs we couldn't answer yet (the user had paused us). Answered on resume. */
   private pendingDialogs = new Map<number, any>();
   /** client key -> the tab it was driving, so a daemon restart picks up the right tab (not just any tab in its group). */
-  private savedTabs: Record<string, { tabId: number; instance: string | null }> = {};
+  private savedTabs: Record<string, { tabId: number; instance: string | null; at?: number }> = {};
 
   constructor(
     readonly bridge: Bridge,
@@ -246,7 +248,7 @@ export class Pilot {
     // Only for tabs a session is actually driving: tabs we've let go of are the user's business.
     bridge.on("cdp", (tabId: number, method: string, p: any) => {
       if (method !== "Page.javascriptDialogOpening") return;
-      if (!this.attachments.has(tabId)) return;
+      if (!this.attachments.has(tabId) && !this.attaching.has(tabId)) return;
       this.pendingDialogs.set(tabId, p);
       this.answerDialog(tabId);
     });
@@ -283,12 +285,13 @@ export class Pilot {
   async setTab(s: Session, tabId: number) {
     const old = s.tabId;
     s.tabId = tabId;
-    this.savedTabs[s.key] = { tabId, instance: this.bridge.instanceId };
+    this.savedTabs[s.key] = { tabId, instance: this.bridge.instanceId, at: Date.now() };
     this.saveTabs();
     if (old !== null && old !== tabId) await this.release(s, old);
   }
 
   private async release(s: Session, tabId: number) {
+    await this.attaching.get(tabId)?.catch(() => {}); // let an in-flight attach land first, then undo it
     const users = this.attachments.get(tabId);
     if (!users) return;
     users.delete(s.id);
@@ -301,6 +304,12 @@ export class Pilot {
   }
 
   private saveTabs() {
+    // Every shim process gets a fresh key, so keep this small: only the most recent sessions matter.
+    const keys = Object.keys(this.savedTabs);
+    if (keys.length > 50) {
+      keys.sort((a, b) => (this.savedTabs[b].at ?? 0) - (this.savedTabs[a].at ?? 0));
+      for (const k of keys.slice(50)) delete this.savedTabs[k];
+    }
     try {
       writeFileSync(join(homeDir(), "sessions.json"), JSON.stringify(this.savedTabs));
     } catch {
@@ -326,6 +335,11 @@ export class Pilot {
 
   async closeSession(s: Session) {
     this.sessions.delete(s.id);
+    // A clean goodbye means nobody will come back for this tab. (Crashes and daemon restarts keep the entry.)
+    if (!s.expired && this.savedTabs[s.key]) {
+      delete this.savedTabs[s.key];
+      this.saveTabs();
+    }
     for (const [tabId, users] of this.attachments) {
       users.delete(s.id);
       if (users.size === 0) {
@@ -392,7 +406,9 @@ export class Pilot {
         const t = await this.bridge.call<any>("tabs.get", { tabId: saved.tabId }).catch(() => null);
         if (t) {
           s.tabId = saved.tabId;
-          s.groupId = t.groupId ?? null;
+          // The saved tab may be one of the user's (tab_select). Only reuse *our* group, never theirs.
+          const ours = await this.bridge.call<{ groupId: number } | null>("groups.find", { title: s.groupTitle }).catch(() => null);
+          s.groupId = ours?.groupId ?? null;
           log(`session ${s.label} picked up where it left off on tab ${saved.tabId}`);
           return s.tabId;
         }
@@ -483,6 +499,7 @@ export class Pilot {
       },
       timeoutMs,
     );
+    wait.promise.catch(() => {}); // early exits below never await it; don't leave a rejection hanging
     try {
       const r = await trigger();
       triggered = true;
@@ -496,7 +513,11 @@ export class Pilot {
       }
       if (r?.errorText === "net::ERR_ABORTED") {
         const still = await this.bridge.call("tabs.get", { tabId }).catch(() => null);
-        throw new Error(still ? "Navigation was canceled (another navigation, or the page itself, stopped it)." : "The tab was closed while it was loading.");
+        throw new Error(
+          still
+            ? "That navigation didn't produce a page: it was a download, an empty 204 response, or another navigation canceled it."
+            : "The tab was closed while it was loading.",
+        );
       }
       if (r?.errorText === "net::ERR_BLOCKED_BY_CLIENT") throw new Error("The browser blocked that page (an ad blocker or another extension, most likely).");
       if (r?.errorText) throw new Error(`Navigation failed: ${r.errorText}`);
@@ -521,6 +542,9 @@ export class Pilot {
   /** Navigate without CDP (for tabs sitting on a page we can't debug), then take the controls again. */
   async navigatePlain(s: Session, url: string, timeoutMs: number): Promise<"loaded" | "timeout"> {
     const tabId = await this.tab(s);
+    if (this.released.has(tabId)) {
+      throw new Error(`The user took back tab ${tabId}. Ask them before grabbing it again, then call tab_select with force: true.`);
+    }
     const before = await this.bridge.call<any>("tabs.get", { tabId });
     await this.bridge.call("tabs.navigate", { tabId, url });
     const deadline = Date.now() + timeoutMs;
@@ -530,8 +554,12 @@ export class Pilot {
       t = await this.bridge.call<any>("tabs.get", { tabId });
       // Don't take the old page's "complete" for the new one.
     } while ((t.status !== "complete" || t.url === before.url) && Date.now() < deadline);
+    const landed = t.status === "complete" && t.url !== before.url;
+    if (!landed && /^(chrome|chrome-extension|chrome-untrusted|devtools|edge|brave|view-source|about):/i.test(t.url) && t.url !== "about:blank") {
+      throw new Error(`The page didn't load within ${timeoutMs}ms, and the tab is still on ${t.url}, which Chrome won't let extensions drive.`);
+    }
     await this.attach(s, tabId);
-    return t.status === "complete" ? "loaded" : "timeout";
+    return landed ? "loaded" : "timeout";
   }
 
   async mouse(s: Session, x: number, y: number, opts: { button?: string; clickCount?: number; modifiers?: number; hoverOnly?: boolean } = {}) {

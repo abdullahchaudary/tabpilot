@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import { networkInterfaces } from "node:os";
 import { loadConfig, newPairingCode, paths, saveConfig } from "./config.js";
@@ -46,17 +47,30 @@ function lanAddresses(): string[] {
     .map((a) => a!.address);
 }
 
+/** What a process was started with, or null if we can't tell (Windows, or it's gone). */
+function commandLine(pid: number): string | null {
+  try {
+    return readFileSync(`/proc/${pid}/cmdline`, "utf8").replace(/\0/g, " ");
+  } catch {}
+  if (process.platform === "win32") return null;
+  try {
+    return execFileSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf8" }).trim() || null;
+  } catch {
+    return null;
+  }
+}
+
 async function stop(): Promise<boolean> {
   const health = await daemonHealth(loadConfig());
   const filePid = existsSync(paths.pid()) ? Number(readFileSync(paths.pid(), "utf8")) : NaN;
   // Only ever signal a process we know is our daemon: the one /health vouches for, or (if it's hung) a pid
   // whose command line is clearly tabpilot. A stale pid file can point at some unrelated process by now.
   let pid: number | null = health?.pid ?? null;
+  // A daemon from before /health reported its pid: it's answering, so the pid file is its own.
+  if (pid === null && health && Number.isInteger(filePid)) pid = filePid;
   if (pid === null && Number.isInteger(filePid)) {
-    try {
-      const cmd = readFileSync(`/proc/${filePid}/cmdline`, "utf8");
-      if (/tabpilot|cli\.js/.test(cmd) && /daemon/.test(cmd)) pid = filePid;
-    } catch {}
+    const cmd = commandLine(filePid);
+    if (cmd && /tabpilot|cli\.js/.test(cmd) && /daemon/.test(cmd)) pid = filePid;
   }
   if (pid === null) {
     if (existsSync(paths.pid())) unlinkSync(paths.pid());

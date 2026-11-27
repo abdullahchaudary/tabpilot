@@ -381,7 +381,7 @@ export class Bridge extends EventEmitter {
         cancel();
         reject(
           new Error(
-            reason === undefined
+            reason === undefined || reason === "target_closed"
               ? "The tab was closed while I was waiting on it."
               : reason === "canceled_by_user" || reason === "released_by_user"
                 ? `The user took back tab ${tabId} while I was waiting on it.`
