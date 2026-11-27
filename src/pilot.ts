@@ -459,11 +459,23 @@ export class Pilot {
   }
 
   /** Background tabs can't paint, so screenshots of them hang. Bring the tab forward if it's hidden. */
-  async ensureVisible(s: Session) {
-    const state = await this.evaluate<string>(s, "document.visibilityState").catch(() => "visible");
-    if (state !== "visible") {
-      await this.bridge.call("tabs.activate", { tabId: await this.tab(s) });
-      await new Promise((r) => setTimeout(r, 250));
+  // Background tabs don't paint, and a freshly opened tab can report a 0x0 viewport for a beat
+  // before Chrome lays it out. Bring it forward if needed, then wait (briefly) for a real size.
+  async ensureVisible(s: Session, timeoutMs = 4000) {
+    const deadline = Date.now() + timeoutMs;
+    let activated = false;
+    for (;;) {
+      const v = await this.evaluate<{ vis: string; w: number; h: number }>(
+        s,
+        "({vis: document.visibilityState, w: innerWidth, h: innerHeight})",
+      ).catch(() => ({ vis: "visible", w: 1, h: 1 }));
+      if (v.vis === "visible" && v.w > 0 && v.h > 0) return;
+      if (!activated && v.vis !== "visible") {
+        await this.bridge.call("tabs.activate", { tabId: await this.tab(s) });
+        activated = true;
+      }
+      if (Date.now() > deadline) return;
+      await new Promise((r) => setTimeout(r, 150));
     }
   }
 }

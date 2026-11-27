@@ -242,6 +242,16 @@ export function createMcpServer(pilot: Pilot, s: Session): McpServer {
         s,
         "({x: scrollX, y: scrollY, w: innerWidth, h: innerHeight, dpr: devicePixelRatio})",
       );
+      if (!(view.w > 0 && view.h > 0)) {
+        // innerWidth can lag behind on a brand new tab; ask Chrome directly.
+        const m = await pilot.cdp(s, "Page.getLayoutMetrics");
+        const lv = m.cssLayoutViewport ?? m.layoutViewport;
+        view.w = lv?.clientWidth ?? 0;
+        view.h = lv?.clientHeight ?? 0;
+        if (!(view.w > 0 && view.h > 0)) {
+          throw new Error("The tab has no size yet, so there's nothing to capture. Is the browser window minimized? Ask the user to un-minimize it, or wait a second and try again.");
+        }
+      }
       let clip: { x: number; y: number; width: number; height: number };
       let what = "viewport";
       if (ref || selector || byText) {
